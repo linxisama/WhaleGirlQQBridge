@@ -22,19 +22,29 @@ def connection_path() -> pathlib.Path:
     return base / 'WhaleQQGateway' / 'core' / 'connection.json'
 
 
-def _alive(pid: int) -> bool:
+def _pid_state(pid: int) -> str:
+    """返回 alive / denied / dead。
+
+    denied 表示进程确实在，但当前控制台权限不够、打不开它（例如管理器
+    以管理员身份运行）。这种情况不能当成"已退出"，否则控制台永远连不上。
+    """
     if not pid:
-        return False
+        return 'dead'
     try:
         import ctypes
-        kernel32 = ctypes.windll.kernel32
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(0x1000, False, int(pid))     # QUERY_LIMITED_INFORMATION
-        if not handle:
-            return False
-        kernel32.CloseHandle(handle)
-        return True
+        if handle:
+            kernel32.CloseHandle(handle)
+            return 'alive'
+        return 'denied' if ctypes.get_last_error() == 5 else 'dead'  # ERROR_ACCESS_DENIED
     except Exception:
-        return False
+        return 'dead'
 
 
 def read_connection(path: pathlib.Path | None = None) -> dict:
@@ -46,7 +56,7 @@ def read_connection(path: pathlib.Path | None = None) -> dict:
         return {}
     if not isinstance(data, dict) or not data.get('base_url'):
         return {}
-    if data.get('pid') and not _alive(int(data.get('pid') or 0)):
+    if data.get('pid') and _pid_state(int(data.get('pid') or 0)) == 'dead':
         return {}
     return data
 
@@ -71,11 +81,34 @@ def fetch_accounts(connection: dict, timeout: float = 3.0) -> dict:
             'active': (data or {}).get('active', '')}
 
 
+def _manager_candidates() -> list[pathlib.Path]:
+    """管理器可能被装到的位置（用户目录、Program Files、绿色版）。"""
+    roots: list[pathlib.Path] = []
+    local = os.getenv('LOCALAPPDATA')
+    if local:
+        roots += [pathlib.Path(local) / 'Programs' / 'WhaleQQGateway',
+                  pathlib.Path(local) / 'WhaleQQGateway']
+    for env in ('ProgramFiles', 'ProgramFiles(x86)', 'ProgramW6432'):
+        base = os.getenv(env)
+        if base:
+            roots.append(pathlib.Path(base) / 'WhaleQQGateway')
+    seen: set[str] = set()
+    candidates: list[pathlib.Path] = []
+    for root in roots:
+        candidate = root / 'WhaleQQGateway.exe'
+        key = str(candidate).lower()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+    return candidates
+
+
 def manager_exe() -> str:
     """管理器安装位置（用于「打开管理器」按钮）；找不到返回空串。"""
-    base = pathlib.Path(os.getenv('LOCALAPPDATA') or pathlib.Path.home())
-    candidate = base / 'Programs' / 'WhaleQQGateway' / 'WhaleQQGateway.exe'
-    return str(candidate) if candidate.is_file() else ''
+    for candidate in _manager_candidates():
+        if candidate.is_file():
+            return str(candidate)
+    return ''
 
 def start_headless_bot(connection: dict, account_id: str, source: str,
                        timeout: float = 120.0) -> dict:

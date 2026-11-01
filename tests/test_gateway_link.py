@@ -5,9 +5,11 @@ import pathlib
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from src.gateway_link import fetch_accounts, read_connection
+import src.gateway_link as gateway_link
+from src.gateway_link import fetch_accounts, manager_exe, read_connection
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -65,6 +67,53 @@ class GatewayLinkTests(unittest.TestCase):
 
     def test_no_connection_info(self):
         self.assertFalse(fetch_accounts({})['ok'])
+
+    def test_denied_pid_is_accepted(self):
+        self.path.write_text(json.dumps({'base_url': 'http://127.0.0.1:1',
+                                         'token': 't', 'pid': 999999}), encoding='utf-8')
+        with mock.patch.object(gateway_link, '_pid_state', return_value='denied'):
+            data = read_connection(self.path)
+        self.assertEqual(data['base_url'], 'http://127.0.0.1:1')
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows only')
+    def test_pid_state_alive_and_dead(self):
+        self.assertEqual(gateway_link._pid_state(os.getpid()), 'alive')
+        self.assertEqual(gateway_link._pid_state(999999), 'dead')
+
+    def test_manager_exe_finds_local_programs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / 'local'
+            prog = pathlib.Path(tmp) / 'prog'
+            (local / 'Programs' / 'WhaleQQGateway').mkdir(parents=True)
+            (local / 'Programs' / 'WhaleQQGateway' / 'WhaleQQGateway.exe').write_bytes(b'MZ')
+            (prog / 'WhaleQQGateway').mkdir(parents=True)
+            (prog / 'WhaleQQGateway' / 'WhaleQQGateway.exe').write_bytes(b'MZ')
+            env = {'LOCALAPPDATA': str(local), 'ProgramFiles': str(prog),
+                   'ProgramFiles(x86)': str(prog), 'ProgramW6432': str(prog)}
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertEqual(pathlib.Path(manager_exe()),
+                                 local / 'Programs' / 'WhaleQQGateway' / 'WhaleQQGateway.exe')
+
+    def test_manager_exe_finds_program_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / 'local'
+            prog = pathlib.Path(tmp) / 'prog'
+            (prog / 'WhaleQQGateway').mkdir(parents=True)
+            (prog / 'WhaleQQGateway' / 'WhaleQQGateway.exe').write_bytes(b'MZ')
+            env = {'LOCALAPPDATA': str(local), 'ProgramFiles': str(prog),
+                   'ProgramFiles(x86)': str(prog), 'ProgramW6432': str(prog)}
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertEqual(pathlib.Path(manager_exe()),
+                                 prog / 'WhaleQQGateway' / 'WhaleQQGateway.exe')
+
+    def test_manager_exe_missing_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / 'local'
+            prog = pathlib.Path(tmp) / 'prog'
+            env = {'LOCALAPPDATA': str(local), 'ProgramFiles': str(prog),
+                   'ProgramFiles(x86)': str(prog), 'ProgramW6432': str(prog)}
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertEqual(manager_exe(), '')
 
 
 if __name__ == '__main__':
