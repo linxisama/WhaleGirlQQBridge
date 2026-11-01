@@ -33,7 +33,7 @@ powershell -ExecutionPolicy Bypass -File .\build_installer.ps1
 
 注意：
 
-- --add-data 必须包含 runtime/qqagent-host、runtime/node、plugin_packages、tools/sandbox、styles、src/web/static 和 Qt 翻译。漏掉 runtime/qqagent-host 会导致安装版插件能力桥永远未就绪。
+- --add-data 必须包含 runtime/qqagent-host、runtime/node、plugin_packages、styles、src/web/static 和 Qt 翻译。漏掉 runtime/qqagent-host 会导致安装版插件能力桥永远未就绪。
 - 构建脚本使用 installer.iss 的 AppVersion，安装包文件名和注册表 DisplayVersion 都取自它。
 - 构建前先跑完整测试。
 

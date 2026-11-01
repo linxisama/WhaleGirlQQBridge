@@ -1,14 +1,16 @@
-# Python
+# 本地虚拟环境 / 构建缓存
 .venv*/
+.venv-build/
+build/
+dist/
+release/
+.build-tools/
 __pycache__/
 *.py[cod]
 *.egg-info/
 .pytest_cache/
 .mypy_cache/
-build/
-dist/
-release/
-.build-tools/
+
 # 用户配置与运行数据（绝不提交密钥）
 config.qq.yaml
 config.qq.yaml.tmp
@@ -18,23 +20,28 @@ logs/
 *.sqlite3
 *.db
 backups/
-# 本地临时/内部
+
+# 临时与内部协作
 .tmp/
 .tmp-upgrade-verify/
 .orchestrator/
 .workbuddy/
+.team-private/
 handoff/
 agents/
 collaboration/
 instructions/
+AGENTS.md
+
 # 安装包/更新包产物
 installer/*.exe
 installer/*.zip
 installer/*.sha256
 *.log
-# Node 运行时与依赖（构建机自备，见 BUILDING.md）
+
+# 运行时 Node 二进制（体积大，构建机自备，见 BUILDING.md）
 runtime/node/
-runtime/qqagent-host/node_modules/
+
 # 编辑器
 .vscode/
 .idea/

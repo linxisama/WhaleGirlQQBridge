@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""离线 UI 集成测试：更新卡 / Windows 沙盒页 / 本地插件包 / DSH 连接体检。"""
+"""离线 UI 集成测试：更新卡 / 本地插件包 / DSH 连接体检。"""
 import copy
 import os
 import time
@@ -12,7 +12,6 @@ from PyQt6.QtWidgets import QApplication, QProgressBar, QTextEdit  # noqa: E402
 import qq_gui  # noqa: E402
 from qq_gui import AboutTab, PluginPacksDialog  # noqa: E402
 from src.gui.agent_panel import AgentBackendPanel  # noqa: E402
-from src.gui.sandbox_page import SandboxPage  # noqa: E402
 
 _APP = None
 
@@ -66,29 +65,6 @@ class FakeApi:
         return self._match(self.post_routes, path)
 
 
-STATUS_DISABLED = {
-    "success": True,
-    "status": "disabled",
-    "supported": True,
-    "ready": False,
-    "detail": "Windows 沙盒可用但尚未启用。",
-    "alternative": "可以使用 Hyper-V 虚拟机",
-    "detection": {"windows_version": "11", "edition": "Pro", "build": "22631"},
-}
-CHANNEL_DEFAULT = {
-    "success": True,
-    "channel": {
-        "name": "default",
-        "exists": True,
-        "wsb_path": "C:/sandbox/default.wsb",
-        "host_folder": "C:/sandbox/host",
-        "sandbox_folder": "C:/sandbox",
-        "ready": True,
-        "ready_marker_path": "C:/sandbox/.ready",
-    },
-}
-
-
 class AboutUpdateCardTests(unittest.TestCase):
     def setUp(self):
         app()
@@ -132,60 +108,6 @@ class AboutUpdateCardTests(unittest.TestCase):
         self.assertIn("2026-10-01", self.tab.update_state.text())
         self.assertIn("完整更新说明第一行", self.tab.update_notes.toPlainText())
         self.assertFalse(self.tab.update_notes.isHidden())
-
-
-class SandboxPageTests(unittest.TestCase):
-    def _page(self, **kwargs):
-        fake = FakeApi({
-            "sandbox/status": STATUS_DISABLED,
-            "sandbox/channel": CHANNEL_DEFAULT,
-        }, {
-            "sandbox/channel": {"success": True, "channel": CHANNEL_DEFAULT["channel"]},
-            "sandbox/enable": {"success": True, "status": "enabled", "ready": True},
-            "sandbox/disable": {"success": True, "status": "disabled", "ready": False},
-        }, **kwargs)
-        page = SandboxPage(fake.get, fake.post)
-        self.addCleanup(page.close)
-        return page, fake
-
-    def test_refresh_shows_chinese_status_and_windows_info(self):
-        page, fake = self._page()
-        self.assertTrue(page.refresh())
-        self.assertTrue(pump_until(lambda: not page.busy))
-        self.assertEqual(page.status_value.text(), "未启用")
-        self.assertIn("Windows 11", page.windows_info.text())
-        self.assertIn("Pro", page.windows_info.text())
-        self.assertIn("22631", page.windows_info.text())
-        self.assertIn("替代方案", page.alternative.text())
-        self.assertTrue(any(path == "sandbox/status" for path, _ in fake.gets))
-
-    def test_create_channel_sends_confirmed_true(self):
-        page, fake = self._page()
-        page.channel_host.setText("D:/sandbox-host")
-        self.assertTrue(page.create_channel())
-        self.assertTrue(pump_until(lambda: bool(fake.posts)))
-        path, body, _ = fake.posts[0]
-        self.assertEqual(path, "sandbox/channel")
-        self.assertEqual(body["name"], "default")
-        self.assertEqual(body["host_folder"], "D:/sandbox-host")
-        self.assertIs(body["confirmed"], True)
-        self.assertIs(body["launch"], False)
-        self.assertIs(body["networking"], False)
-        self.assertIs(body["clipboard"], False)
-
-    def test_unsupported_disables_enable_and_busy_ignores_repeat(self):
-        page, fake = self._page(post_delay=0.25)
-        page.apply_status({"success": True, "status": "unsupported", "supported": False})
-        self.assertFalse(page.btn_enable.isEnabled())
-        page.apply_status(STATUS_DISABLED)
-        self.assertTrue(page.btn_enable.isEnabled())
-        # 先让 apply_status 触发的 channel 读取结束，再测重复点击。
-        self.assertTrue(pump_until(lambda: not page.busy))
-        self.assertTrue(page.create_channel())
-        self.assertTrue(pump_until(lambda: len(fake.posts) == 1))
-        self.assertFalse(page.create_channel())
-        self.assertTrue(pump_until(lambda: not page.busy))
-        self.assertEqual(len(fake.posts), 1)
 
 
 class PluginPacksDialogTests(unittest.TestCase):

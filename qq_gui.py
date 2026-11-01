@@ -6481,9 +6481,6 @@ class MainWindow(QWidget):
         self.memory_tab=MemoryTab(api_get,api_post,self.configure_conversation)
         self.pc_tab=PcTab(api_get,api_post,self.configure_conversation)
         self.about_tab = AboutTab()          # 关于作者：作者/致谢/声明与使用须知
-        from src.gui.sandbox_page import SandboxPage
-        # Windows 沙盒页：状态/启用/隔离通道，所有请求在后台线程里跑。
-        self.sandbox_tab = SandboxPage(api_get, api_post)
         from src.gui.assistant import AssistantTab
         from src.gui.workbench import WorkbenchTab
         self.workbench_tab = WorkbenchTab(api=run_api_async)
@@ -6511,7 +6508,6 @@ class MainWindow(QWidget):
         self.tabs.addTab(self.appearance_tab, slot_icon("tab_appearance"), "外观")
         self.tabs.addTab(self.agent_backend_tab, slot_icon("tab_console"), "外部后端")
         self.tabs.addTab(self.logs_tab, slot_icon("tab_console"), "日志")
-        self.tabs.addTab(self.sandbox_tab, slot_icon("shield"), "Windows 沙盒")
         self.tabs.addTab(self.about_tab, slot_icon("app"), "关于作者")
         self.tabs.setCurrentIndex(0)
         # 标签条隐藏，用左侧列表切换（保留 QTabWidget 的页面管理能力）
@@ -6523,7 +6519,7 @@ class MainWindow(QWidget):
         # 机器人管理、人设、插件、外观四个页面直接进侧栏，不再收进弹出菜单。
         groups = [
             ('工作空间', ['对话', '智能中心', '控制台', '对话与记忆', '机器人管理']),
-            ('管理', ['人设', '插件', '设置', '外观', '外部后端', '日志', 'Windows 沙盒', '关于作者']),
+            ('管理', ['人设', '插件', '设置', '外观', '外部后端', '日志', '关于作者']),
         ]
         titles = {self.tabs.tabText(index): index for index in range(self.tabs.count())}
         self._nav_rows = []          # [(行号, tab 索引或 None)]

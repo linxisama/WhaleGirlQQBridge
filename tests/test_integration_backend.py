@@ -1,6 +1,6 @@
 """后端集成路由的回归测试。
 
-覆盖 GUI 会直接调用的新接口：更新进度轮询、Windows Sandbox 状态/通道/启动/禁用、
+覆盖 GUI 会直接调用的新接口：更新进度轮询、
 插件包扫描与安装，以及启动时 DSH 自动接入改用 dsh_auto_connect_all。
 """
 import asyncio
@@ -15,13 +15,12 @@ import httpx
 from src import app_updater
 from src import plugin_packs
 from src import qq_app
-from src import windows_sandbox
 from src.qq_app import APP_VERSION, QQRuntime, create_app
 from tests.test_persona_files import build_root
 
 
 class _FakeObject:
-    """模拟 windows_sandbox 里带 to_dict() 的 dataclass 返回值。"""
+    """模拟带 to_dict() 的 dataclass 返回值。"""
 
     def __init__(self, **data):
         self._data = dict(data)
@@ -46,11 +45,6 @@ class _BackendRouteTestCase(unittest.IsolatedAsyncioTestCase):
         await self.client.aclose()
         await self.bot.close()
         self.temp.cleanup()
-
-    @property
-    def sandbox_root(self):
-        return self.root / 'data' / 'sandbox'
-
 
 class UpdateProgressRouteTests(_BackendRouteTestCase):
     async def test_progress_is_idle_empty_snapshot_before_any_task(self):
@@ -128,148 +122,6 @@ class UpdateProgressRouteTests(_BackendRouteTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('未经确认', response.json()['detail'])
         check.assert_not_called()
-
-
-class SandboxRouteTests(_BackendRouteTestCase):
-    async def test_status_returns_detection_payload(self):
-        detection = _FakeObject(ok=True, status='ready', available=True,
-                                detail='Windows Sandbox 可用')
-        with mock.patch.object(windows_sandbox, 'detect', return_value=detection) as detect:
-            response = await self.client.get('/api/sandbox/status')
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertTrue(body['success'])
-        self.assertEqual(body['status'], 'ready')
-        self.assertTrue(body['available'])
-        detect.assert_called_once_with()
-
-    async def test_enable_requires_confirmation(self):
-        response = await self.client.post('/api/sandbox/enable', json={})
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('未经确认', response.json()['detail'])
-
-    async def test_enable_returns_success_and_status(self):
-        with mock.patch.object(windows_sandbox, 'ensure_ready',
-                               return_value={'ok': True, 'status': 'ready',
-                                             'detail': '已启用'}) as ready:
-            response = await self.client.post('/api/sandbox/enable',
-                                              json={'confirmed': True})
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertTrue(body['success'])
-        self.assertEqual(body['status'], 'ready')
-        ready.assert_called_once_with(apply=True)
-
-    async def test_enable_unsupported_is_not_a_500(self):
-        with mock.patch.object(windows_sandbox, 'ensure_ready',
-                               return_value={'ok': False, 'status': 'unsupported',
-                                             'detail': '当前系统不支持'}):
-            response = await self.client.post('/api/sandbox/enable',
-                                              json={'confirmed': True, 'apply': False})
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertFalse(body['success'])
-        self.assertEqual(body['status'], 'unsupported')
-
-    async def test_channel_status_uses_default_name_and_root(self):
-        status = _FakeObject(name='default', exists=True, wsb_path='')
-        with mock.patch.object(windows_sandbox, 'read_channel_status',
-                               return_value=status) as read:
-            response = await self.client.get('/api/sandbox/channel')
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertTrue(response.json()['success'])
-        self.assertEqual(response.json()['channel']['name'], 'default')
-        read.assert_called_once_with(name='default', root=self.sandbox_root)
-
-    async def test_channel_create_defaults_host_folder_under_bot_root(self):
-        config = _FakeObject(host_folder='', networking=False, clipboard=False,
-                             read_only=True, memory_mb=2048)
-        channel = _FakeObject(name='demo', wsb_path=str(self.sandbox_root / 'demo' / 'demo.wsb'))
-        status = _FakeObject(name='demo', exists=True, wsb_path=channel.wsb_path)
-        captured = {}
-
-        def fake_default(host_folder, **overrides):
-            captured['host_folder'] = host_folder
-            captured['overrides'] = overrides
-            return config
-
-        with mock.patch.object(windows_sandbox, 'default_config',
-                               side_effect=fake_default), \
-                mock.patch.object(windows_sandbox, 'create_isolation_channel',
-                                  return_value=channel) as create, \
-                mock.patch.object(windows_sandbox, 'read_channel_status',
-                                  return_value=status) as read:
-            response = await self.client.post('/api/sandbox/channel', json={
-                'name': 'demo', 'launch': True, 'confirmed': True,
-                'networking': True, 'clipboard': False, 'read_only': True,
-                'memory_mb': 2048})
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertTrue(body['success'])
-        self.assertEqual(body['channel']['name'], 'demo')
-        self.assertEqual(body['status']['name'], 'demo')
-        expected = str(self.sandbox_root / 'demo' / 'workspace')
-        self.assertEqual(captured['host_folder'], expected)
-        self.assertEqual(captured['overrides']['networking'], True)
-        self.assertEqual(captured['overrides']['read_only'], True)
-        self.assertEqual(captured['overrides']['memory_mb'], 2048)
-        create.assert_called_once_with(config, name='demo', root=self.sandbox_root,
-                                       launch=True)
-        read.assert_called_once_with(name='demo', root=self.sandbox_root)
-
-    async def test_channel_create_launch_needs_confirmation(self):
-        response = await self.client.post('/api/sandbox/channel', json={
-            'name': 'demo', 'launch': True})
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('未经确认', response.json()['detail'])
-
-    async def test_launch_requires_confirmation(self):
-        response = await self.client.post('/api/sandbox/launch', json={'name': 'default'})
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('未经确认', response.json()['detail'])
-
-    async def test_launch_returns_404_when_channel_has_no_wsb(self):
-        status = _FakeObject(name='default', exists=False, wsb_path='')
-        with mock.patch.object(windows_sandbox, 'read_channel_status', return_value=status):
-            response = await self.client.post('/api/sandbox/launch', json={
-                'name': 'default', 'confirmed': True})
-        self.assertEqual(response.status_code, 404)
-        self.assertIn('隔离通道', response.json()['detail'])
-
-    async def test_launch_uses_existing_wsb_and_returns_result(self):
-        wsb = self.sandbox_root / 'default' / 'default.wsb'
-        wsb.parent.mkdir(parents=True, exist_ok=True)
-        wsb.write_text('<Configuration></Configuration>', encoding='utf-8')
-        status = _FakeObject(name='default', exists=True, wsb_path=str(wsb))
-        result = _FakeObject(ok=True, status='started', command='WindowsSandbox.exe',
-                             detail='', pid=1234)
-        with mock.patch.object(windows_sandbox, 'read_channel_status', return_value=status), \
-                mock.patch.object(windows_sandbox, 'launch_sandbox',
-                                  return_value=result) as launch:
-            response = await self.client.post('/api/sandbox/launch', json={
-                'name': 'default', 'confirmed': True})
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertTrue(body['success'])
-        self.assertEqual(body['launch']['status'], 'started')
-        launch.assert_called_once_with(str(wsb))
-
-    async def test_disable_requires_confirmation(self):
-        response = await self.client.post('/api/sandbox/disable', json={})
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('未经确认', response.json()['detail'])
-
-    async def test_disable_returns_unsupported_without_500(self):
-        result = _FakeObject(ok=False, status='unsupported', detail='当前系统不支持')
-        with mock.patch.object(windows_sandbox, 'disable_sandbox',
-                               return_value=result) as disable:
-            response = await self.client.post('/api/sandbox/disable',
-                                              json={'confirmed': True})
-        self.assertEqual(response.status_code, 200, response.text)
-        body = response.json()
-        self.assertFalse(body['success'])
-        self.assertEqual(body['status'], 'unsupported')
-        disable.assert_called_once_with(apply=False)
 
 
 class PluginPacksRouteTests(_BackendRouteTestCase):

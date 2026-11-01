@@ -400,6 +400,19 @@ class UpdateScriptTests(unittest.TestCase):
         self.assertIn(b":install", raw)
         self.assertIn(b":wait", raw)
 
+    def test_wait_loop_uses_ping_instead_of_timeout(self):
+        raw = app_updater.build_update_script(self.setup, self.app, 11).read_bytes()
+        self.assertIn(b"ping -n 3 127.0.0.1 >nul", raw)
+        self.assertNotIn(b"timeout /t 2", raw)
+        self.assertIn(b'findstr /I /C:"%APPNAME%"', raw)
+
+    def test_launch_uses_hidden_console(self):
+        with mock.patch.object(app_updater.subprocess, "Popen") as popen:
+            app_updater.launch_update_script(self.setup)
+        args, kwargs = popen.call_args
+        self.assertEqual(args[0][0], "cmd.exe")
+        self.assertTrue(kwargs["creationflags"] & app_updater.subprocess.CREATE_NO_WINDOW)
+        self.assertFalse(kwargs["creationflags"] & getattr(app_updater.subprocess, "DETACHED_PROCESS", 0))
     def test_percent_in_install_dir_is_escaped(self):
         script = app_updater.build_update_script(self.setup, self.app, 7,
                                                  install_dir="C:\\100%\\WhaleGirl")

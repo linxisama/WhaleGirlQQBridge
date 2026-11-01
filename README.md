@@ -1,6 +1,6 @@
 # WhaleGirlQQBridge / 鲸鱼娘 QQ 账号版
 
-Windows 上的 QQ 机器人控制台：官方 QQ 机器人接入、人设与记忆、插件与插件市场、DSH（DeepSeek Harness）联动、Windows 沙盒测试通道，以及带 SHA256 校验的安装版自动更新。
+Windows 上的 QQ 机器人控制台：官方 QQ 机器人接入、人设与记忆、插件与插件市场、DSH（DeepSeek Harness）联动，以及带 SHA256 校验的安装版自动更新。
 
 > 本项目只负责本机控制台和 QQ 官方机器人接入，不包含 QQ 客户端外挂、自动抢红包、批量登录等能力。
 
@@ -11,7 +11,6 @@ Windows 上的 QQ 机器人控制台：官方 QQ 机器人接入、人设与记�
 - **人设与记忆**：多人设、当前人设、手动/确认/候选记忆、日记。
 - **插件**：插件市场、本地插件包、独立目录、启停/移除、异常隔离、文件上传字段。
 - **DSH 联动**：自动发现本机 DSH profile，登记 whale_memory / whale_bot / whale_tools 三组 MCP，新会话即可调用；连接体检会说明缺什么、是否需要重启。
-- **Windows 沙盒**：检测/启用/禁用、隔离通道、共享目录、启动沙盒。
 - **自动更新**：GitHub Releases 检查、完整更新说明、下载进度、SHA256 校验、退出后静默安装、失败重试。
 - **无开发环境运行**：安装包自带 Python 运行时和 runtime/qqagent-host 能力桥；插件宿主所需的 Node 运行时也随包提供。
 
@@ -57,7 +56,7 @@ ai:
 
 - 内置包在 plugin_packages/<id>/，含 plugin.json、README.md、入口 .py。
 - 控制台「插件 → 本地插件包」可手动安装；不会自动安装。
-- 用户插件复制到 %LOCALAPPDATA%\WhaleGirlQQ\data\qq-only\custom_plugins\<id>\，停用不删文件。
+- 用户插件复制到 %LOCALAPPDATA%\WhaleGirlQQ\data\custom_plugins\<id>\，停用不删文件。
 - 插件配置的文件字段会把文件复制到 data/plugin_uploads，不会自动上传公网。
 
 ## 测试

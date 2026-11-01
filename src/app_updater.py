@@ -621,15 +621,15 @@ def build_update_script(setup_path, app_exe, pid: int, install_dir=None) -> Path
         "set /a TRIES+=1",
         # 卡死的旧实例不能让安装永远等下去：约 10 分钟后记日志继续装。
         "if %TRIES% GTR 300 goto waittimeout",
-        # 后台 worker 和启动器是两个进程；只等 PID 会在启动器还占着 exe 时开始安装。
-        'tasklist /FI "PID eq %PID%" /NH 2>nul | findstr /C:"%PID%" >nul',
+        # PID 可能被系统复用；命中 PID 后还要确认映像名，避免把别的进程当成控制台。
+        'tasklist /FI "PID eq %PID%" /NH 2>nul | findstr /I /C:"%APPNAME%" >nul',
         "if not errorlevel 1 (",
-        "  timeout /t 2 /nobreak >nul",
+        "  ping -n 3 127.0.0.1 >nul",
         "  goto wait",
         ")",
         'tasklist /FI "IMAGENAME eq %APPNAME%" /NH 2>nul | findstr /I /C:"%APPNAME%" >nul',
         "if not errorlevel 1 (",
-        "  timeout /t 2 /nobreak >nul",
+        "  ping -n 3 127.0.0.1 >nul",
         "  goto wait",
         ")",
         "goto install",
@@ -665,7 +665,9 @@ def launch_update_script(script_path) -> None:
         raise ValueError("更新脚本不存在：" + str(script))
     flags = 0
     if os.name == "nt":
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        # 不要用 DETACHED_PROCESS：没有控制台时 tasklist 不产出任何输出，
+        # 等待循环会空转到超时才安装。隐藏控制台既能后台运行，也能让 tasklist 正常输出。
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     subprocess.Popen(["cmd.exe", "/c", str(script)], cwd=str(script.parent),
                      creationflags=flags, close_fds=True,
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

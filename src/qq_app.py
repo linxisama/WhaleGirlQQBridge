@@ -53,7 +53,6 @@ from . import qqagent_host
 from . import qqagent_market
 from . import app_updater
 from . import plugin_packs
-from . import windows_sandbox
 from . import skill_market
 from . import skill_manifest
 from . import tool_loop
@@ -3864,123 +3863,6 @@ def create_app(runtime=None):
                 "message": "安装包已下载，控制台退出后会静默安装并重新打开",
                 "download": download, "script": str(script),
                 "progress": progress.snapshot(), **info}
-
-    # ── Windows Sandbox：检测 / 启用 / 隔离通道 / 启动 / 禁用 ────────────────
-    # 全部是系统级操作，一律丢线程跑，绝不阻塞事件循环；unsupported 是正常结果，
-    # 用 200 + success=false 带出，不升级成 500。
-    def _sandbox_root():
-        return app.state.bot.root / "data" / "sandbox"
-
-    def _plain(result):
-        """模块里有的返回 dataclass（有 to_dict），有的直接返回 dict，统一折平。"""
-        return result.to_dict() if hasattr(result, "to_dict") else dict(result or {})
-
-    @app.get("/api/sandbox/status")
-    async def sandbox_status():
-        try:
-            detection = await asyncio.to_thread(windows_sandbox.detect)
-        except Exception as exc:
-            raise HTTPException(500, "检测 Windows Sandbox 失败：" + safe_error(exc)) from None
-        return {"success": True, **_plain(detection)}
-
-    @app.post("/api/sandbox/enable")
-    async def sandbox_enable(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        if body.get("confirmed") is not True:
-            raise HTTPException(400, "未经确认：启用 Windows Sandbox 需要管理员权限，可能还要重启")
-        apply = body.get("apply", True)
-        apply = True if apply is None else bool(apply)
-        try:
-            result = await asyncio.to_thread(windows_sandbox.ensure_ready, apply=apply)
-        except Exception as exc:
-            raise HTTPException(500, "启用 Windows Sandbox 失败：" + safe_error(exc)) from None
-        payload = _plain(result)
-        return {"success": bool(payload.get("ok")), **payload}
-
-    @app.get("/api/sandbox/channel")
-    async def sandbox_channel(name: str = "default"):
-        try:
-            status = await asyncio.to_thread(
-                windows_sandbox.read_channel_status, name=name, root=_sandbox_root())
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from None
-        return {"success": True, "channel": status.to_dict()}
-
-    @app.post("/api/sandbox/channel")
-    async def sandbox_channel_create(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        name = str(body.get("name") or "").strip() or "default"
-        root = _sandbox_root()
-        host_folder = str(body.get("host_folder") or "").strip()
-        if not host_folder:
-            # 默认落在 <bot.root>/data/sandbox/<name>/workspace，与通道元数据同根。
-            host_folder = str(root / name / "workspace")
-        launch = body.get("launch") is True
-        if launch and body.get("confirmed") is not True:
-            raise HTTPException(400, "未经确认：创建并启动隔离通道会把宿主目录映射进 Windows Sandbox")
-        try:
-            memory_mb = int(body.get("memory_mb") or 0)
-        except (TypeError, ValueError):
-            raise HTTPException(400, "memory_mb 必须是整数") from None
-        try:
-            config = windows_sandbox.default_config(
-                host_folder,
-                networking=body.get("networking") is True,
-                clipboard=body.get("clipboard") is True,
-                read_only=body.get("read_only") is True,
-                memory_mb=memory_mb)
-            channel = await asyncio.to_thread(
-                windows_sandbox.create_isolation_channel, config,
-                name=name, root=root, launch=launch)
-            status = await asyncio.to_thread(
-                windows_sandbox.read_channel_status, name=name, root=root)
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from None
-        return {"success": True, "channel": channel.to_dict(), "status": status.to_dict()}
-
-    @app.post("/api/sandbox/launch")
-    async def sandbox_launch(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        if body.get("confirmed") is not True:
-            raise HTTPException(400, "未经确认：启动 Windows Sandbox 会打开一个隔离桌面")
-        name = str(body.get("name") or "").strip() or "default"
-        try:
-            status = await asyncio.to_thread(
-                windows_sandbox.read_channel_status, name=name, root=_sandbox_root())
-        except ValueError as exc:
-            raise HTTPException(400, str(exc)) from None
-        wsb_path = str(getattr(status, "wsb_path", "") or "")
-        if not wsb_path or not Path(wsb_path).is_file():
-            raise HTTPException(404, "隔离通道 %s 还没有可用的 .wsb 配置，请先创建通道" % name)
-        launch = await asyncio.to_thread(windows_sandbox.launch_sandbox, wsb_path)
-        payload = _plain(launch)
-        return {"success": bool(payload.get("ok")), "launch": payload}
-
-    @app.post("/api/sandbox/disable")
-    async def sandbox_disable(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        if body.get("confirmed") is not True:
-            raise HTTPException(400, "未经确认：禁用 Windows Sandbox 会移除可选功能，可能还要重启")
-        apply = body.get("apply", False)
-        try:
-            result = await asyncio.to_thread(
-                windows_sandbox.disable_sandbox, apply=bool(apply))
-        except Exception as exc:
-            raise HTTPException(500, "禁用 Windows Sandbox 失败：" + safe_error(exc)) from None
-        payload = _plain(result)
-        return {"success": bool(payload.get("ok")), **payload}
 
     @app.post('/api/runtime/quit')
     async def runtime_quit():
