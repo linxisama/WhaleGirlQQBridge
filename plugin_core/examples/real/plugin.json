@@ -1,0 +1,49 @@
+{
+  "id": "real",
+  "name": "关键词回复",
+  "version": "1.0.0",
+  "api_version": 1,
+  "author": {
+    "name": "插件内核参考实现",
+    "contact": "kernel@example.invalid"
+  },
+  "description": "关键词回复：规则表里挑第一条命中",
+  "entry": "plugin.py:setup",
+  "permissions": [
+    "read_message",
+    "send_message",
+    "store"
+  ],
+  "capabilities": [
+    {
+      "stage": "inbound",
+      "produces": "main",
+      "priority": 90
+    }
+  ],
+  "side": "both",
+  "data_policy": "retain",
+  "upstream": {
+    "protocol": "mock",
+    "kernel": "plugin_core",
+    "range": ">=1.0.0 <2.0.0"
+  },
+  "native": true,
+  "storage": {
+    "keys": [
+      "hits"
+    ]
+  },
+  "config_schema": {
+    "enabled": {
+      "type": "bool",
+      "title": "启用",
+      "default": true
+    },
+    "rules": {
+      "type": "text",
+      "title": "规则表（每行 关键词=回复）",
+      "default": "在吗=在的，有事直接说。\\n价格=报价请看群公告第一条。\\n帮助=发送「关键词=回复」即可配置。"
+    }
+  }
+}

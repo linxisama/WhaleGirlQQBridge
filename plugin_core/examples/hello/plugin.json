@@ -1,0 +1,44 @@
+{
+  "id": "hello",
+  "name": "Hello 示例",
+  "version": "1.0.0",
+  "api_version": 1,
+  "author": {
+    "name": "插件内核参考实现",
+    "contact": "kernel@example.invalid"
+  },
+  "description": "最小可用插件：收到任意消息回固定文本",
+  "entry": "plugin.py:setup",
+  "permissions": [
+    "read_message",
+    "send_message",
+    "store"
+  ],
+  "capabilities": [
+    {
+      "stage": "inbound",
+      "produces": "main",
+      "priority": 20
+    }
+  ],
+  "side": "both",
+  "data_policy": "retain",
+  "upstream": {
+    "protocol": "mock",
+    "kernel": "plugin_core",
+    "range": ">=1.0.0 <2.0.0"
+  },
+  "native": true,
+  "storage": {
+    "keys": [
+      "hits"
+    ]
+  },
+  "config_schema": {
+    "reply": {
+      "type": "string",
+      "title": "固定回复",
+      "default": "你好，我是 hello 插件。"
+    }
+  }
+}

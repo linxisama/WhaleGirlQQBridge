@@ -1,0 +1,20 @@
+{
+  "app": "Magpie_909_icon.png",
+  "tab_console": "Magpie_907_icon.png",
+  "tab_settings": "Magpie_903_icon.png",
+  "tab_persona": "Magpie_901_icon.png",
+  "tab_plugin": "Magpie_911_icon.png",
+  "tab_appearance": "Magpie_905_icon.png",
+  "dialog": "Magpie_912_icon.png",
+  "card_messages": "Magpie_902_icon.png",
+  "card_events": "Magpie_913_icon.png",
+  "card_appearance": "Magpie_906_icon.png",
+  "card_persona_list": "Magpie_914_icon.png",
+  "card_persona_edit": "Magpie_904_icon.png",
+  "btn_save": "Magpie_908_icon.png",
+  "btn_reload": "Magpie_910_icon.png",
+  "btn_new": "Magpie_911_icon.png",
+  "btn_delete": "Magpie_903_icon.png",
+  "btn_apply": "Magpie_913_icon.png",
+  "notice": "Magpie_906_icon.png"
+}

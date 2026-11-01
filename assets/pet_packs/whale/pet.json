@@ -1,0 +1,9 @@
+{
+  "format": "whale-pet",
+  "version": 1,
+  "id": "whale",
+  "name": "鲸鱼娘",
+  "fps": 8,
+  "scale": 0.8,
+  "frames": ["whale.png"]
+}

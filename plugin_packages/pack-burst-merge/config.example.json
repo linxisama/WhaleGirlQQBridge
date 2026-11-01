@@ -1,0 +1,5 @@
+{
+  "enabled": false,
+  "cap_ms": 8000,
+  "quiet_ms": 600
+}

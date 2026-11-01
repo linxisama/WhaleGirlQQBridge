@@ -1,0 +1,10 @@
+{
+  "id": "mod-keyword-reply",
+  "name": "关键词自动回复（目录 mod 样例）",
+  "description": "消息包含关键词时直接返回预设回复，不经过 AI。行为与内置插件 keyword_reply 一致，用来演示目录 mod 的 装 / 跑 / 禁 / 摘 四步。",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "keyword_reply.py",
+  "permissions": ["read_message"],
+  "enabled_by_default": false
+}

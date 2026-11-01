@@ -1,0 +1,16 @@
+{
+  "id": "pack-repeat-guard",
+  "name": "复读闸门（独立包）",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "repeat_guard.py",
+  "host": "WhaleGirlQQ",
+  "min_host_version": "5.2.0",
+  "category": "rhythm",
+  "enabled_by_default": false,
+  "description": "同一群里同一句话超过阈值就静默丢弃，拦在入队前。",
+  "permissions": [
+    "read_message"
+  ],
+  "source": "src/plugins/anti_repeat.py"
+}

@@ -1,0 +1,13 @@
+fastapi==0.143.0
+uvicorn==0.54.0
+httpx==0.28.1
+PyYAML==6.0.3
+cryptography==50.0.2
+loguru==0.7.3
+websockets==17.2
+
+PyQt6==6.11.0
+PyQt6-Qt6==6.11.2
+PyQt6-sip==13.13.0
+
+meme-generator==0.2.3

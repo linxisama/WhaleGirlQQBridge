@@ -1,0 +1,17 @@
+{
+  "id": "voice_console",
+  "name": "语音控制台",
+  "version": "1.0.2",
+  "entry": "voice_console.py",
+  "license": "MIT",
+  "host": "WhaleGirlQQBridge",
+  "min_host_version": "5.1.2",
+  "enabled_by_default": false,
+  "category": "voice",
+  "description": "本地TTS配置、检测、朗读发送及Agent状态/急停，复用宿主音频网关。",
+  "required_host_features": ["AudioGateway", "audio_console", "OneBot record sender", "native file picker"],
+  "permissions": ["loopback_tts", "managed_audio_uploads", "send_to_authorized_origin_chat", "owner_agent_status_and_stop"],
+  "not_implemented": ["singing_gui_pipeline", "device_pairing", "remote_approval", "remote_resume"],
+  "external_dependencies": [],
+  "installation": "在控制台能力与插件页从本地ZIP预检后安装；安装器部署单文件voice_console.py。"
+}

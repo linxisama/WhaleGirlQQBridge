@@ -1,0 +1,16 @@
+{
+  "id": "pack-burst-merge",
+  "name": "连发合并（独立包）",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "burst_merge.py",
+  "host": "WhaleGirlQQ",
+  "min_host_version": "5.2.0",
+  "category": "rhythm",
+  "enabled_by_default": false,
+  "description": "同一人连发时先等一会，把几条消息合成一次模型调用。",
+  "permissions": [
+    "read_message"
+  ],
+  "source": "src/plugins/burst_merge.py"
+}

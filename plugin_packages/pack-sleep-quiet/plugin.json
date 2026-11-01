@@ -1,0 +1,16 @@
+{
+  "id": "pack-sleep-quiet",
+  "name": "睡眠时段静默（独立包）",
+  "version": "1.0.0",
+  "api_version": 1,
+  "entry": "sleep_quiet.py",
+  "host": "WhaleGirlQQ",
+  "min_host_version": "5.2.0",
+  "category": "rhythm",
+  "enabled_by_default": false,
+  "description": "在设定的时间段内不回复，被 @ 时可选放行。",
+  "permissions": [
+    "read_message"
+  ],
+  "source": "src/plugins/sleep_mode.py"
+}

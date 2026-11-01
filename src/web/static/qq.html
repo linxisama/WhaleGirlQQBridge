@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>鲸鱼娘 · QQ 控制台</title>
+<style>
+:root{color-scheme:dark;font-family:"Microsoft YaHei",system-ui,sans-serif;color:#eaf1ff;background:#0b1220}*{box-sizing:border-box}body{margin:0}
+header,main{max-width:1200px;margin:auto;padding:26px}
+header{display:flex;align-items:center;justify-content:space-between;gap:20px}
+h1{font-size:26px;margin:0 0 8px}h2{font-size:18px;margin:0 0 18px}p,.hint{color:#a9bad0;font-size:13px;line-height:1.8}
+.badge{color:#72ddd1;font-size:12px;letter-spacing:2px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.card{background:#131f31;border:1px solid #273750;border-radius:16px;padding:24px;margin-bottom:20px}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:16px}.stats .card{padding:18px}
+.value{font-size:17px;margin-top:10px;overflow-wrap:anywhere}
+label{display:block;font-size:13px;color:#c4d2e5;margin:15px 0 7px}
+input,select,textarea{width:100%;font:inherit;font-size:14px;background:#0c1625;border:1px solid #344760;border-radius:8px;color:#eff5ff;padding:11px}
+input[type=checkbox]{width:auto}input[type=range]{width:auto;flex:1}
+button{font:inherit;font-size:13px;border:0;border-radius:8px;padding:11px 17px;background:#58d5c5;color:#062523;cursor:pointer}
+button.secondary{background:#2b3b54;color:#edf3ff}button.danger{background:#7a1f1f;color:#ffd0d0}
+button:disabled{opacity:.5;cursor:wait}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.notice{padding:13px 16px;background:#1b3046;border-radius:8px;margin:0 0 20px;white-space:pre-wrap;overflow-wrap:anywhere}
+.error{color:#ffb3b3}.ok{color:#72ddd1}code{font-size:12px;color:#8fddd6;overflow-wrap:anywhere}
+.feed{max-height:400px;overflow:auto}
+.message{border-bottom:1px solid #2b3b50;padding:14px 0;font-size:13px;white-space:pre-wrap;overflow-wrap:anywhere}
+.meta{font-size:11px;color:#9cacbf;margin-bottom:7px}.reply{color:#83dccf;margin-top:8px}a{color:#86c5ff}
+[hidden]{display:none!important}
+/* Tabs */
+.tabs{display:flex;gap:2px;border-bottom:1px solid #273750;margin-bottom:20px}
+.tab-btn{background:none;border:0;border-bottom:3px solid transparent;color:#7a94b0;padding:10px 18px;font:inherit;font-size:14px;cursor:pointer;border-radius:0}
+.tab-btn.active{color:#58d5c5;border-bottom-color:#58d5c5}
+.tab-panel{display:none}.tab-panel.active{display:block}
+/* Plugin list */
+.plugin-row{display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid #1e2d3f}
+.plugin-row:last-child{border-bottom:0}
+.plugin-info{flex:1;min-width:0}
+.plugin-name{font-size:14px;font-weight:600;margin-bottom:3px}
+.plugin-desc{font-size:12px;color:#7a94b0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.plugin-tag{font-size:10px;background:#1a2d42;color:#5a9fd6;padding:2px 7px;border-radius:10px;margin-left:8px;vertical-align:middle}
+/* Toggle switch */
+.toggle{position:relative;width:44px;height:24px;flex-shrink:0}
+.toggle input{opacity:0;width:0;height:0}
+.toggle-slider{position:absolute;inset:0;background:#253748;border-radius:12px;cursor:pointer;transition:.3s}
+.toggle-slider:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#7a94b0;border-radius:50%;transition:.3s}
+.toggle input:checked+.toggle-slider{background:#1a4d45}
+.toggle input:checked+.toggle-slider:before{transform:translateX(20px);background:#58d5c5}
+/* Modal */
+.modal-bg{position:fixed;inset:0;background:rgba(5,10,20,.8);z-index:100;display:flex;align-items:center;justify-content:center}
+.modal{background:#0f1e30;border:1px solid #2d4060;border-radius:16px;padding:28px;width:min(560px,96vw);max-height:90vh;overflow-y:auto;position:relative}
+.modal h3{margin:0 0 18px;font-size:17px}
+.modal-close{position:absolute;top:14px;right:16px;background:none;border:0;color:#7a94b0;font-size:22px;cursor:pointer;padding:0}
+.field-group{border-top:1px solid #1e2d3f;margin-top:16px;padding-top:10px}
+.field-group-title{font-size:11px;color:#5a7090;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px}
+.schema-row{margin-bottom:14px}
+.schema-label{display:flex;align-items:center;gap:8px;font-size:13px;color:#c4d2e5;margin-bottom:5px}
+.schema-desc{font-size:11px;color:#5a7090;margin-top:4px}
+.schema-range-row{display:flex;align-items:center;gap:10px}
+.schema-range-val{font-size:13px;color:#58d5c5;min-width:40px;text-align:right}
+/* Persona card */
+.persona-card{background:#0c1a2a;border:1px solid #1e3450;border-radius:12px;padding:18px;margin-bottom:16px}
+.persona-name{font-size:20px;font-weight:700;color:#58d5c5;margin:0 0 6px}
+.persona-lock{font-size:11px;color:#7a94b0;background:#1a2d3f;padding:3px 9px;border-radius:8px;margin-left:10px;vertical-align:middle}
+.persona-prompt{font-size:12px;color:#8ca3bc;background:#071018;border:1px solid #1a2d40;border-radius:8px;padding:12px;max-height:200px;overflow:auto;font-family:monospace;white-space:pre-wrap}
+/* Logs */
+.log-toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px}
+.log-toolbar label{display:flex;align-items:center;gap:6px;margin:0;font-size:13px;color:#c4d2e5}
+.log-toolbar select,.log-toolbar input[type=search]{width:auto;min-width:140px;padding:8px 10px;font-size:13px}
+.log-status{font-size:13px;color:#a9bad0;margin:0 0 12px}
+.log-status.error{color:#ffb3b3}
+.log-list{border:1px solid #1e2d3f;border-radius:10px;max-height:560px;overflow:auto}
+.log-head,.log-row{display:grid;grid-template-columns:150px 62px 88px minmax(0,1fr);gap:10px;padding:9px 12px;font-size:12.5px;align-items:center}
+.log-head{color:#7a94b0;background:#0f1a29;border-bottom:1px solid #1e2d3f;position:sticky;top:0;z-index:1}
+.log-row{border-bottom:1px solid #16212f;cursor:pointer;white-space:nowrap}
+.log-row:hover{background:#152436}
+.log-msg{overflow:hidden;text-overflow:ellipsis}
+.log-time{color:#8ca3bc}
+.log-level{font-weight:700}
+.log-error{color:#ff8080}.log-warning{color:#ffd479}.log-info{color:#8fb6e0}.log-debug{color:#9cacbf}
+.log-detail{display:none;background:#071018;border-bottom:1px solid #1e2d3f;padding:12px 14px}
+.log-detail.open{display:block}
+.log-detail pre{margin:8px 0 12px;font-family:Consolas,"Courier New",monospace;font-size:12px;color:#cfe0f2;white-space:pre-wrap;overflow-wrap:anywhere;max-height:320px;overflow:auto}
+@media(max-width:760px){.grid,.stats{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}header,main{padding:18px}.card{padding:18px}}
+</style></head>
+<body>
+<header>
+  <div><div class="badge">WHALE GIRL / QQ</div><h1>鲸鱼娘 · QQ 控制台</h1><p style="margin:0">选好接入方式，连接你的鲸鱼娘。</p></div>
+  <div class="row"><button id="start">启动机器人</button><button id="stop" class="secondary">停止</button></div>
+</header>
+<main>
+  <div id="compat-banner" class="notice" hidden>
+    <strong>浏览器兼容控制台</strong>：<span id="compat-reason">此入口不创建桌面窗口，沿用原配置与记录。</span>
+    <p>关闭网页不会停止后台。需要退出时，请先停止机器人，再点击下方按钮。</p>
+    <button id="quit-console" class="secondary">退出兼容控制台</button>
+  </div>
+  <div id="notice" class="notice" role="status" aria-live="polite">正在读取配置…</div>
+  <div class="stats">
+    <div class="card"><span class="hint">机器人服务</span><div class="value" id="running">读取中</div></div>
+    <div class="card"><span class="hint">QQ 接入</span><div class="value" id="connection">读取中</div><p id="connection-detail"></p></div>
+    <div class="card"><span class="hint">模型 / API</span><div class="value" id="model-status">读取中</div><p id="ai-status">尚未测试</p></div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab-btn active" onclick="switchTab('settings')">⚙️ 设置</button>
+    <button class="tab-btn" onclick="switchTab('plugins')">🧩 插件</button>
+    <button class="tab-btn" onclick="switchTab('persona')">🐋 人格</button>
+    <button class="tab-btn" onclick="switchTab('messages')">💬 消息</button>
+    <button class="tab-btn" onclick="switchTab('logs')">📋 日志</button>
+  </div>
+
+  <!-- Settings Tab -->
+  <div id="tab-settings" class="tab-panel active">
+    <form id="settings">
+      <div class="grid">
+        <section class="card"><h2>01 · QQ 接入</h2>
+          <label for="mode">接入方式</label>
+          <select id="mode"><option value="official">QQ 官方机器人 · AppID / AppSecret</option><option value="onebot">普通 QQ · OneBot 11 客户端</option></select>
+          <div id="official-fields">
+            <p>在 QQ 开放平台创建机器人，订阅群 @ 消息和单聊消息。</p>
+            <label for="app-id">AppID</label><input id="app-id" autocomplete="off">
+            <label for="app-secret">AppSecret</label><input id="app-secret" type="password" autocomplete="new-password" placeholder="留空保留已保存的密钥">
+            <label><input id="sandbox" type="checkbox"> 使用沙箱环境</label>
+            <p>把公网 HTTPS 地址的 <code>/qq/callback</code> 转发到本机 <code>http://127.0.0.1:8090/qq/callback</code>。</p>
+          </div>
+          <div id="onebot-fields" hidden>
+            <p>在兼容 OneBot 11 的客户端完成 QQ 扫码登录，再添加反向 WebSocket 连接。</p>
+            <label for="onebot-token">连接令牌</label><input id="onebot-token" type="password" autocomplete="new-password" placeholder="首次请填写一个较长的随机字符串">
+            <p>连接地址：<code>ws://127.0.0.1:8090/qq/onebot</code><br>类型：Universal · 消息格式：array</p>
+          </div>
+          <label for="groups">回复群列表（每行一个，可留空）</label>
+          <textarea id="groups" rows="3" placeholder="官方接入填写群 openid；普通 QQ 填写群号"></textarea>
+          <p>留空允许所有群；群里 @ 鲸鱼娘时回复。</p>
+          <label><input type="checkbox" id="private" checked> 回复私聊消息</label>
+          <button type="button" class="secondary" id="test-qq" style="margin-top:14px">测试已保存的 QQ 接入</button>
+        </section>
+        <section class="card"><h2>02 · 模型与 API</h2>
+          <p>首次读取现有机器人的模型和 API。QQ 版的后续配置单独保存。</p>
+          <label for="api-url">API 地址</label><input id="api-url" type="url" required placeholder="https://你的服务地址/v1">
+          <label for="api-key">API Key</label><input id="api-key" type="password" autocomplete="new-password" placeholder="留空保留已保存的密钥">
+          <label for="model">模型名称</label><input id="model" required placeholder="填写服务商提供的模型名">
+          <label for="api-style">接口格式</label>
+          <select id="api-style"><option value="auto">自动识别</option><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic Messages</option></select>
+          <p id="saved-secrets"></p>
+          <div class="notice">先保存配置，再测试 API 和 QQ 接入，最后在 QQ 发送一条消息完成实测。</div>
+          <div class="row">
+            <button type="submit" id="save">保存全部配置</button>
+            <button type="button" class="secondary" id="test-ai">测试模型 / API</button>
+          </div>
+        </section>
+      </div>
+    </form>
+  </div>
+
+  <!-- Plugins Tab -->
+  <div id="tab-plugins" class="tab-panel">
+    <div class="card">
+      <h2>🧩 触发节奏插件</h2>
+      <p>控制机器人何时回复、怎么回复的行为插件。所有设置实时保存，无需重启。</p>
+      <div id="plugin-list"><p style="color:#7a94b0">加载插件中…</p></div>
+    </div>
+  </div>
+
+  <!-- Persona Tab -->
+  <div id="tab-persona" class="tab-panel">
+    <div class="card">
+      <h2>🐋 人设</h2>
+      <div class="persona-card">
+        <label for="persona-select">已有人设</label>
+        <select id="persona-select"></select>
+        <button id="persona-activate">切换到此人设</button>
+        <div class="hint" style="margin-bottom:8px">System Prompt（只读）</div>
+        <div class="persona-prompt" id="persona-prompt">加载中…</div>
+      </div>
+      <p>这里可查看、切换已有人设。人设编辑、文件上传、图库管理等高级操作仍在桌面控制台中使用；切换兼容入口不会重置配置。</p>
+    </div>
+  </div>
+
+  <!-- Messages Tab -->
+  <div id="tab-messages" class="tab-panel">
+    <div class="grid">
+      <section class="card"><h2>消息与回复</h2>
+        <p>本阶段支持文字聊天。</p>
+        <div id="messages" class="feed">暂无消息</div>
+      </section>
+      <section class="card"><h2>运行记录</h2>
+        <div id="events" class="feed">暂无记录</div>
+        <p>"发送待核实"表示发送中断或未获得确认。请先在 QQ 中查看，系统不会盲目重复发送。</p>
+      </section>
+    </div>
+  </div>
+
+  <!-- Logs Tab -->
+  <div id="tab-logs" class="tab-panel">
+    <div class="card">
+      <h2>📋 运行日志</h2>
+      <div class="log-toolbar">
+        <label for="log-level">级别</label>
+        <select id="log-level">
+          <option value="">全部</option>
+          <option value="error">错误</option>
+          <option value="warning">警告</option>
+          <option value="info">信息</option>
+        </select>
+        <label for="log-source">来源</label>
+        <select id="log-source"><option value="">全部</option></select>
+        <label for="log-query">关键词</label>
+        <input id="log-query" type="search" placeholder="按关键词筛选">
+        <button id="log-refresh" class="secondary">刷新</button>
+        <label for="log-auto"><input id="log-auto" type="checkbox"> 自动刷新（5 秒）</label>
+        <button id="log-copy-all" class="secondary">复制全部</button>
+        <button id="log-export" class="secondary">导出 JSON</button>
+      </div>
+      <p class="log-status" id="log-status">点「刷新」读取日志。</p>
+      <div class="log-list">
+        <div class="log-head"><span>时间</span><span>级别</span><span>来源</span><span>摘要</span></div>
+        <div id="log-list"><p class="hint" style="padding:12px">暂无日志。</p></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- Plugin Config Modal -->
+<div id="plugin-modal" class="modal-bg" hidden>
+  <div class="modal">
+    <button class="modal-close" onclick="closePluginModal()">✕</button>
+    <h3 id="modal-title">插件配置</h3>
+    <div id="modal-body"></div>
+    <div class="row" style="margin-top:20px">
+      <button onclick="savePluginSettings()">保存配置</button>
+      <button class="secondary" onclick="closePluginModal()">取消</button>
+    </div>
+  </div>
+</div>
+
+<script src="/qq.js"></script>
+</body></html>

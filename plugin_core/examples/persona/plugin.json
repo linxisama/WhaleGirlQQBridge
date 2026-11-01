@@ -1,0 +1,55 @@
+{
+  "id": "persona",
+  "name": "Persona 示例",
+  "version": "1.0.0",
+  "api_version": 1,
+  "author": {
+    "name": "插件内核参考实现",
+    "contact": "kernel@example.invalid"
+  },
+  "description": "人设插件：调模型回话，可与他人竞标",
+  "entry": "plugin.py:setup",
+  "permissions": [
+    "read_message",
+    "send_message",
+    "store"
+  ],
+  "capabilities": [
+    {
+      "stage": "inbound",
+      "produces": "main",
+      "priority": 80,
+      "exclusive": true
+    }
+  ],
+  "side": "both",
+  "data_policy": "purge",
+  "upstream": {
+    "protocol": "mock",
+    "kernel": "plugin_core",
+    "range": ">=1.0.0 <2.0.0"
+  },
+  "native": true,
+  "storage": {
+    "keys": [
+      "turns"
+    ]
+  },
+  "config_schema": {
+    "persona": {
+      "type": "string",
+      "title": "人设系统提示",
+      "default": "你是一位简短、克制的助手。"
+    },
+    "keywords": {
+      "type": "list",
+      "title": "接得住的触发词",
+      "default": [
+        "你好",
+        "谢谢",
+        "在吗",
+        "人设"
+      ]
+    }
+  }
+}

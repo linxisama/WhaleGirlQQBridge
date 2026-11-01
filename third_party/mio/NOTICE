@@ -1,0 +1,7 @@
+Mio UI reference
+Copyright (c) 2026 Mio contributors
+MIT License; full text in LICENSE.
+
+The warm default palette and sidebar/settings layout were adapted as design references.
+The PyQt6 navigation implementation and line icon marks are authored for this project.
+No Mio backend, role art, character voice, private data or model assets are included.

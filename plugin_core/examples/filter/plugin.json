@@ -1,0 +1,48 @@
+{
+  "id": "filter",
+  "name": "Filter 示例",
+  "version": "1.0.0",
+  "api_version": 1,
+  "author": {
+    "name": "插件内核参考实现",
+    "contact": "kernel@example.invalid"
+  },
+  "description": "出站管道示例：改写文本或取消发送",
+  "entry": "plugin.py:setup",
+  "permissions": [
+    "send_message"
+  ],
+  "capabilities": [
+    {
+      "stage": "outbound",
+      "produces": "rewrite",
+      "priority": 10
+    }
+  ],
+  "side": "both",
+  "data_policy": "retain",
+  "upstream": {
+    "protocol": "mock",
+    "kernel": "plugin_core",
+    "range": ">=1.0.0 <2.0.0"
+  },
+  "native": false,
+  "storage": {},
+  "config_schema": {
+    "cancel_words": {
+      "type": "list",
+      "title": "命中即取消发送",
+      "default": [
+        "广告"
+      ]
+    },
+    "rewrite_map": {
+      "type": "map",
+      "title": "改写词表",
+      "default": {
+        "傻": "聪明",
+        "内测": "公测"
+      }
+    }
+  }
+}
