@@ -9,7 +9,7 @@ from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import src.gateway_link as gateway_link
-from src.gateway_link import fetch_accounts, manager_exe, read_connection
+from src.gateway_link import connection_paths, fetch_accounts, manager_exe, read_connection
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -54,6 +54,49 @@ class GatewayLinkTests(unittest.TestCase):
         self.path.write_text('{not json', encoding='utf-8')
         self.assertEqual(read_connection(self.path), {})
 
+    def test_connection_paths_cover_appdata_and_install_dirs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            local = pathlib.Path(tmp) / 'local'
+            roaming = pathlib.Path(tmp) / 'roaming'
+            prog = pathlib.Path(tmp) / 'prog'
+            env = {'LOCALAPPDATA': str(local), 'APPDATA': str(roaming),
+                   'ProgramData': str(pathlib.Path(tmp) / 'programdata'),
+                   'ProgramFiles': str(prog), 'ProgramFiles(x86)': str(prog),
+                   'ProgramW6432': str(prog)}
+            with mock.patch.dict(os.environ, env, clear=False):
+                paths = [str(item).lower() for item in connection_paths()]
+        self.assertIn(str(local / 'WhaleQQGateway' / 'core' / 'connection.json').lower(), paths)
+        self.assertIn(str(roaming / 'WhaleQQGateway' / 'core' / 'connection.json').lower(), paths)
+        self.assertIn(str(prog / 'WhaleQQGateway' / 'core' / 'connection.json').lower(), paths)
+
+    def test_read_connection_uses_next_candidate_when_first_is_dead(self):
+        dead = pathlib.Path(self._tmp.name) / 'dead.json'
+        live = pathlib.Path(self._tmp.name) / 'live.json'
+        dead.write_text(json.dumps({'base_url': 'http://127.0.0.1:1',
+                                    'token': 'old', 'pid': 999999}), encoding='utf-8')
+        live.write_text(json.dumps({'base_url': 'http://127.0.0.1:2',
+                                    'token': 'new', 'pid': os.getpid()}), encoding='utf-8')
+        with mock.patch.object(gateway_link, 'connection_paths', return_value=[dead, live]):
+            data = read_connection()
+        self.assertEqual(data['base_url'], 'http://127.0.0.1:2')
+
+    def test_manager_exe_prefers_running_process(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / 'Portable' / 'WhaleQQGateway.exe'
+            exe.parent.mkdir(parents=True)
+            exe.write_bytes(b'MZ')
+            with mock.patch.object(gateway_link, '_running_manager_exe', return_value=str(exe)):
+                self.assertEqual(manager_exe(), str(exe))
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows only')
+    def test_running_manager_exe_reads_get_process_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = pathlib.Path(tmp) / 'WhaleQQGateway.exe'
+            exe.write_bytes(b'MZ')
+            completed = mock.Mock(stdout=str(exe) + '\n', returncode=0)
+            with mock.patch('subprocess.run', return_value=completed):
+                self.assertEqual(gateway_link._running_manager_exe(), str(exe))
+
     def test_fetch_accounts(self):
         server = ThreadingHTTPServer(('127.0.0.1', 0), _Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -90,9 +133,10 @@ class GatewayLinkTests(unittest.TestCase):
             (prog / 'WhaleQQGateway' / 'WhaleQQGateway.exe').write_bytes(b'MZ')
             env = {'LOCALAPPDATA': str(local), 'ProgramFiles': str(prog),
                    'ProgramFiles(x86)': str(prog), 'ProgramW6432': str(prog)}
-            with mock.patch.dict(os.environ, env, clear=False):
-                self.assertEqual(pathlib.Path(manager_exe()),
-                                 local / 'Programs' / 'WhaleQQGateway' / 'WhaleQQGateway.exe')
+            with mock.patch.object(gateway_link, '_running_manager_exe', return_value=''):
+                with mock.patch.dict(os.environ, env, clear=False):
+                    self.assertEqual(pathlib.Path(manager_exe()),
+                                     local / 'Programs' / 'WhaleQQGateway' / 'WhaleQQGateway.exe')
 
     def test_manager_exe_finds_program_files(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,9 +146,10 @@ class GatewayLinkTests(unittest.TestCase):
             (prog / 'WhaleQQGateway' / 'WhaleQQGateway.exe').write_bytes(b'MZ')
             env = {'LOCALAPPDATA': str(local), 'ProgramFiles': str(prog),
                    'ProgramFiles(x86)': str(prog), 'ProgramW6432': str(prog)}
-            with mock.patch.dict(os.environ, env, clear=False):
-                self.assertEqual(pathlib.Path(manager_exe()),
-                                 prog / 'WhaleQQGateway' / 'WhaleQQGateway.exe')
+            with mock.patch.object(gateway_link, '_running_manager_exe', return_value=''):
+                with mock.patch.dict(os.environ, env, clear=False):
+                    self.assertEqual(pathlib.Path(manager_exe()),
+                                     prog / 'WhaleQQGateway' / 'WhaleQQGateway.exe')
 
     def test_manager_exe_missing_is_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,8 +157,9 @@ class GatewayLinkTests(unittest.TestCase):
             prog = pathlib.Path(tmp) / 'prog'
             env = {'LOCALAPPDATA': str(local), 'ProgramFiles': str(prog),
                    'ProgramFiles(x86)': str(prog), 'ProgramW6432': str(prog)}
-            with mock.patch.dict(os.environ, env, clear=False):
-                self.assertEqual(manager_exe(), '')
+            with mock.patch.object(gateway_link, '_running_manager_exe', return_value=''):
+                with mock.patch.dict(os.environ, env, clear=False):
+                    self.assertEqual(manager_exe(), '')
 
 
 if __name__ == '__main__':

@@ -1907,6 +1907,12 @@ class SettingsTab(QWidget):
         try:
             import subprocess
             subprocess.Popen([exe], close_fds=True)
+            # 设置页里的按钮也要让主窗口开始等管理器，否则这里点完仍会一直“未连接”。
+            window = self.window()
+            starter = getattr(window, '_start_manager_retry', None)
+            if callable(starter):
+                starter()
+                QTimer.singleShot(2500, window._retry_manager_connection)
         except Exception as error:
             tell(self, '打开管理器失败', f'{type(error).__name__}: {error}', kind='warning')
 
@@ -6843,6 +6849,9 @@ class MainWindow(QWidget):
         try:
             import subprocess
             subprocess.Popen([exe], close_fds=True)
+            if '已连接' not in self.manager_status.text():
+                self._start_manager_retry()
+                QTimer.singleShot(2500, self._retry_manager_connection)
         except Exception as error:
             tell(self, '打开管理器失败', f'{type(error).__name__}: {error}', kind='warning')
 
@@ -6901,12 +6910,18 @@ class MainWindow(QWidget):
                 widget.setVisible(False)
             self.account_hint.setText('中继与 QQ 由管理器负责，这里只管机器人回复')
             return
+        connected = False
         try:
             self.settings_tab.manager_url.setText(str(self._cfg.get('manager_base_url') or ''))
-            if not self.load_manager_accounts():
+            connected = self.load_manager_accounts()
+            if not connected:
                 self._reload_accounts_async()
         except Exception:
             self._reload_accounts_async()
+        if connected:
+            self._stop_manager_retry()
+        else:
+            self._start_manager_retry()
 
     def _refresh_plugins_safely(self):
         try:
@@ -6921,27 +6936,70 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-    def load_manager_accounts(self):
+    def _ensure_manager_retry_timer(self):
+        """管理器可能比控制台晚启动：用一个轻量定时器在未连接时自动重试。"""
+        timer = getattr(self, '_manager_retry_timer', None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setInterval(8000)
+            timer.timeout.connect(self._retry_manager_connection)
+            self._manager_retry_timer = timer
+        return timer
+
+    def _start_manager_retry(self):
+        if getattr(self, '_launch_job', None):
+            return
+        timer = self._ensure_manager_retry_timer()
+        if not timer.isActive():
+            timer.start()
+        try:
+            text = self.manager_status.text()
+            if '自动重试' not in text:
+                self.manager_status.setText(text + ' · 正在自动重试…')
+        except Exception:
+            pass
+
+    def _stop_manager_retry(self):
+        timer = getattr(self, '_manager_retry_timer', None)
+        if timer is not None:
+            timer.stop()
+
+    def _retry_manager_connection(self):
+        """定时器回调：只在未连接时跑，连上就停表。"""
+        if getattr(self, '_launch_job', None):
+            self._stop_manager_retry()
+            return
+        try:
+            if self.load_manager_accounts(timeout=1.0, retrying=True):
+                self._stop_manager_retry()
+        except Exception:
+            pass
+
+    def load_manager_accounts(self, timeout: float = 3.0, retrying: bool = False):
         """从管理器读账号（只读）；失败就退回本地账号簿。
 
         优先用设置页里手填的地址/令牌；没填就读管理器写下的 connection.json。
+        retrying=True 时状态文案会说明“正在自动重试”，避免用户以为卡死。
         """
         from src.gateway_link import fetch_accounts, read_connection
         configured = {'base_url': str(self._cfg.get('manager_base_url') or ''),
                       'token': str(self._cfg.get('manager_token') or '')}
         connection = configured if configured['base_url'] else read_connection()
+        suffix = ' · 正在自动重试…' if retrying else ''
         if not connection:
-            self.manager_status.setText('未连接管理器（账号以管理器为准）')
+            self.manager_status.setText('未连接管理器（账号以管理器为准）' + suffix)
             try:
                 self.settings_tab.set_manager_status(
-                    '未连接管理器：点「打开管理器」启动并扫码登录')
+                    '未连接管理器：点「打开管理器」启动并扫码登录'
+                    + ('（会自动重试）' if retrying else ''))
             except Exception:
                 pass
             self.manager_button.setVisible(True)
             return False
-        result = fetch_accounts(connection)
+        result = fetch_accounts(connection, timeout=timeout)
         if not result.get('ok'):
-            self.manager_status.setText('管理器不可达：' + str(result.get('message') or ''))
+            self.manager_status.setText(
+                '管理器不可达：' + str(result.get('message') or '') + suffix)
             self.manager_button.setVisible(True)
             return False
         items = result.get('items') or []
@@ -7557,6 +7615,14 @@ class MainWindow(QWidget):
         if ok:
             self._load_settings()
         self._busy = False
+        # 管理器地址/令牌可能刚改过：立刻试一次，失败就继续自动轮询。
+        try:
+            if self.load_manager_accounts(timeout=1.0, retrying=True):
+                self._stop_manager_retry()
+            else:
+                self._start_manager_retry()
+        except Exception:
+            self._start_manager_retry()
 
     # ── 获取模型列表 / 测试连接 ────────────────────────────────────────────
     # 两个动作都拿**当前输入框的值**（Key 留空 = 用已保存的密钥），跑在后台线程里，

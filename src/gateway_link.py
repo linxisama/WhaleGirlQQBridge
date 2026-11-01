@@ -11,15 +11,58 @@ import json
 import os
 import pathlib
 
-__all__ = ['connection_path', 'read_connection', 'fetch_accounts', 'manager_exe',
-           'start_headless_bot']
+__all__ = ['connection_path', 'connection_paths', 'read_connection', 'fetch_accounts',
+           'manager_exe', 'start_headless_bot']
 
 import requests
 
 
+def _env_path(name: str) -> pathlib.Path | None:
+    value = os.getenv(name)
+    return pathlib.Path(value) if value else None
+
+
+def connection_paths() -> list[pathlib.Path]:
+    r"""管理器可能写连接文件的位置，按优先级排列。
+
+    除了标准的 %LOCALAPPDATA%\WhaleQQGateway，还覆盖：
+    - 漫游/公共数据目录（有些安装器用 APPDATA/ProgramData）；
+    - 绿色版或自定义安装目录（连接文件就在 exe 旁边或 data 子目录）。
+    """
+    roots: list[pathlib.Path] = []
+    for env in ('LOCALAPPDATA', 'APPDATA', 'ProgramData'):
+        base = _env_path(env)
+        if base:
+            roots += [base / 'WhaleQQGateway', base / 'WhaleQQGateway' / 'data']
+    for candidate in _manager_candidates():
+        roots += [candidate.parent, candidate.parent / 'data']
+
+    paths: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        candidate = root / 'core' / 'connection.json'
+        key = str(candidate).lower()
+        if key not in seen:
+            seen.add(key)
+            paths.append(candidate)
+    # 旧版/便携版有时直接把 connection.json 放在数据根目录
+    local = _env_path('LOCALAPPDATA')
+    if local:
+        legacy = local / 'WhaleQQGateway' / 'connection.json'
+        if str(legacy).lower() not in seen:
+            paths.append(legacy)
+    if not paths:
+        paths.append(pathlib.Path.home() / 'WhaleQQGateway' / 'core' / 'connection.json')
+    return paths
+
+
 def connection_path() -> pathlib.Path:
-    base = pathlib.Path(os.getenv('LOCALAPPDATA') or pathlib.Path.home())
-    return base / 'WhaleQQGateway' / 'core' / 'connection.json'
+    """第一个存在的连接文件；都不存在时返回标准位置（兼容旧调用）。"""
+    paths = connection_paths()
+    for candidate in paths:
+        if candidate.is_file():
+            return candidate
+    return paths[0]
 
 
 def _pid_state(pid: int) -> str:
@@ -47,9 +90,7 @@ def _pid_state(pid: int) -> str:
         return 'dead'
 
 
-def read_connection(path: pathlib.Path | None = None) -> dict:
-    """读管理器连接信息；文件不存在、损坏或进程已退出都返回 {}。"""
-    target = pathlib.Path(path) if path else connection_path()
+def _read_connection_file(target: pathlib.Path) -> dict:
     try:
         data = json.loads(target.read_text(encoding='utf-8'))
     except (OSError, ValueError):
@@ -59,6 +100,20 @@ def read_connection(path: pathlib.Path | None = None) -> dict:
     if data.get('pid') and _pid_state(int(data.get('pid') or 0)) == 'dead':
         return {}
     return data
+
+
+def read_connection(path: pathlib.Path | None = None) -> dict:
+    """读管理器连接信息；文件不存在、损坏或进程已退出都返回 {}。
+
+    不指定路径时按 connection_paths() 依次尝试：旧位置残留的 connection.json
+    可能指向已经退出的进程，不能因为它存在就放弃后面仍然有效的位置。
+    """
+    targets = [pathlib.Path(path)] if path else connection_paths()
+    for target in targets:
+        data = _read_connection_file(target)
+        if data:
+            return data
+    return {}
 
 
 def fetch_accounts(connection: dict, timeout: float = 3.0) -> dict:
@@ -103,8 +158,36 @@ def _manager_candidates() -> list[pathlib.Path]:
     return candidates
 
 
+def _running_manager_exe() -> str:
+    """正在运行的管理器 exe 路径（覆盖绿色版/自定义安装目录）。
+
+    固定候选目录找不到时，用 Get-Process 问一下系统；只在 Windows 上尝试，
+    失败就安静地返回空串，不影响后面的固定目录探测。
+    """
+    if os.name != 'nt':
+        return ''
+    try:
+        import subprocess
+        completed = subprocess.run(
+            ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command',
+             '(Get-Process -Name WhaleQQGateway -ErrorAction SilentlyContinue | '
+             'Select-Object -First 1 -ExpandProperty Path)'],
+            capture_output=True, text=True, timeout=4,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+        for line in (completed.stdout or '').splitlines():
+            candidate = line.strip().strip('"')
+            if candidate and pathlib.Path(candidate).is_file():
+                return candidate
+    except Exception:
+        pass
+    return ''
+
+
 def manager_exe() -> str:
     """管理器安装位置（用于「打开管理器」按钮）；找不到返回空串。"""
+    running = _running_manager_exe()
+    if running:
+        return running
     for candidate in _manager_candidates():
         if candidate.is_file():
             return str(candidate)
