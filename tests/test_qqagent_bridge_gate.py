@@ -99,6 +99,16 @@ class UnregisteredExtensionTests(GateBase):
         chosen = self.plugin._event_profiles(dict(MESSAGE), 'on_prepare')
         self.assertEqual([item['extensionId'] for item in chosen], ['wp1d-handmade'])
 
+    def test_discoverable_but_unregistered_profile_still_dispatches(self):
+        """市场里能发现、但状态文件没登记过的历史 profile 不能被默认停用误杀。"""
+        self.configure([hook_profile()])
+        with mock.patch('src.extension_registry.is_known', return_value=True), \
+                mock.patch('src.extension_registry.is_enabled', return_value=False):
+            self.assertTrue(self.plugin._registry_disabled(IDENT))
+            self.assertFalse(self.plugin._registry_disabled(IDENT, strict=False))
+            chosen = self.plugin._event_profiles(dict(MESSAGE), 'on_prepare')
+        self.assertEqual([item['extensionId'] for item in chosen], [IDENT])
+
     @unittest.skipUnless(READY, '需要 node + host-one.mjs + qq-agent-run 运行副本')
     def test_unregistered_manual_profile_really_runs(self):
         self.configure([hook_profile(extensionId='wp1d-handmade')])

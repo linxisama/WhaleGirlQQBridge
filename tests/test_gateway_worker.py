@@ -1,11 +1,13 @@
 """安装版控制台被网关拉起：账号配置、无控制台环境、自检入口参数。"""
 import contextlib
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import yaml
 
@@ -202,6 +204,89 @@ class HeadlessAutostartTests(unittest.TestCase):
             self.assertTrue((root / "data" / "qq-only" / "logs" / "gateway-boot.log").is_file())
         loop.call_soon_threadsafe(loop.stop)
         worker.join(timeout=5)
+
+class GatewayPluginStoreTests(unittest.TestCase):
+    """网关账号必须有自己完整的插件库，不能永远回退到共享目录。"""
+
+    def _shared(self, base: Path) -> Path:
+        shared = base / 'local' / 'WhaleGirlQQ' / 'data' / 'qq-only'
+        (shared / 'qqagent_host' / 'plugins' / 'ext-a').mkdir(parents=True)
+        (shared / 'qqagent_host' / 'host-one.mjs').write_text('// host', encoding='utf-8')
+        (shared / 'qqagent_host' / 'plugins' / 'ext-a' / 'plugin.json').write_text(
+            '{"id":"ext-a","name":"甲"}', encoding='utf-8')
+        (shared / 'qqagent_extensions').mkdir()
+        (shared / 'qqagent_extensions.json').write_text(
+            '{"version":1,"extensions":{"ext-a":{"enabled":true}}}', encoding='utf-8')
+        (shared / 'qqagent_bridge_catalog.json').write_text('[]', encoding='utf-8')
+        return shared
+
+    def _job(self, root: Path) -> dict:
+        return {'root': str(root), 'ws_url': 'ws://x/y', 'access_token': 't',
+                'port': 1, 'parent': 0}
+
+    def test_prepare_migrates_shared_store_and_rewrites_bridge_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared = self._shared(base)
+            settings = {'qqagent_bridge': {
+                'enabled': True,
+                'hostRoot': str(shared / 'qqagent_host'),
+                'catalogPath': str(shared / 'qqagent_bridge_catalog.json'),
+                'extensionsDir': str(shared / 'qqagent_host' / 'plugins'),
+                'sourceDir': str(shared / 'source'),
+                # 手写配置可能用正斜杠，迁移时也必须改到账号目录。
+                'extensionPath': str(shared / 'qqagent_host' / 'plugins' / 'ext-a').replace('\\', '/'),
+            }}
+            (shared / 'plugin_settings.json').write_text(
+                json.dumps(settings, ensure_ascii=False), encoding='utf-8')
+            root = base / 'bot'
+            with mock.patch.dict(os.environ, {'LOCALAPPDATA': str(base / 'local')}):
+                gateway_worker.prepare(self._job(root))
+            own = root / 'data' / 'qq-only'
+            self.assertTrue((own / 'qqagent_host' / 'host-one.mjs').is_file())
+            self.assertTrue((own / 'qqagent_extensions.json').is_file())
+            self.assertTrue((own / 'qqagent_bridge_catalog.json').is_file())
+            saved = json.loads(
+                (own / 'plugin_settings.json').read_text(encoding='utf-8'))
+            bridge = saved['qqagent_bridge']
+            self.assertEqual(bridge['hostRoot'], str(own / 'qqagent_host'))
+            self.assertEqual(bridge['extensionsDir'], str(own / 'qqagent_host' / 'plugins'))
+            self.assertEqual(bridge['catalogPath'], str(own / 'qqagent_bridge_catalog.json'))
+            self.assertEqual(bridge['sourceDir'], str(own / 'source'))
+
+            from src.qq_app import QQRuntime
+            runtime = object.__new__(QQRuntime)
+            runtime.root = root
+            self.assertEqual(runtime._plugin_dir(), own)
+
+    def test_prepare_merges_settings_without_overwriting_account_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared = self._shared(base)
+            shared_settings = {'qqagent_bridge': {
+                'enabled': True, 'ownerIds': '2019117802',
+                'hostRoot': str(shared / 'qqagent_host')},
+                'sharedOnly': {'added': True}}
+            (shared / 'plugin_settings.json').write_text(
+                json.dumps(shared_settings, ensure_ascii=False), encoding='utf-8')
+            root = base / 'bot'
+            own = root / 'data' / 'qq-only'
+            own.mkdir(parents=True)
+            own_settings = {'qqagent_bridge': {'enabled': False, 'custom': 'keep'},
+                            'ownOnly': {'keep': True}}
+            (own / 'plugin_settings.json').write_text(
+                json.dumps(own_settings, ensure_ascii=False), encoding='utf-8')
+            with mock.patch.dict(os.environ, {'LOCALAPPDATA': str(base / 'local')}):
+                gateway_worker.prepare(self._job(root))
+            saved = json.loads(
+                (own / 'plugin_settings.json').read_text(encoding='utf-8'))
+            self.assertFalse(saved['qqagent_bridge']['enabled'])
+            self.assertEqual(saved['qqagent_bridge']['custom'], 'keep')
+            self.assertEqual(saved['qqagent_bridge']['ownerIds'], '2019117802')
+            self.assertEqual(saved['qqagent_bridge']['hostRoot'], str(own / 'qqagent_host'))
+            self.assertTrue(saved['ownOnly']['keep'])
+            self.assertTrue(saved['sharedOnly']['added'])
+
 
 
 if __name__ == '__main__':

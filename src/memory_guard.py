@@ -284,18 +284,37 @@ def backup(memory, out_dir, db_path='', keep=BACKUP_KEEP, now=None):
     while target.exists():
         target = folder / ('memory-' + stamp + '-' + str(index) + '.db')
         index += 1
-    target_conn = sqlite3.connect(str(target))
-    try:
-        memory.db.backup(target_conn)
-    except Exception:
-        target_conn.close()
+    # 备份后必须自己验一遍：sqlite backup 偶尔会在磁盘满/权限异常时留下
+    # 0 字节或残缺文件，旧实现只看返回值，坏备份会一直留在“记忆”目录里。
+    last_error = None
+    for attempt in range(2):
+        target_conn = sqlite3.connect(str(target))
         try:
-            target.unlink()
-        except OSError:
-            pass
-        raise
-    else:
-        target_conn.close()
+            memory.db.backup(target_conn)
+            target_conn.commit()
+            size = target.stat().st_size
+            check = target_conn.execute('PRAGMA integrity_check').fetchone()
+            result = str(check[0] if check else '').strip().lower()
+            if size <= 0 or result != 'ok':
+                raise RuntimeError(f'备份校验失败：{size} 字节，integrity_check={result or "空"}')
+        except Exception as exc:
+            last_error = exc
+            try:
+                target_conn.close()
+            except Exception:
+                pass
+            try:
+                target.unlink()
+            except OSError:
+                pass
+            if attempt == 0:
+                continue
+            raise
+        else:
+            target_conn.close()
+            break
+    if last_error is not None and not target.exists():
+        raise last_error
     keep = max(1, int(keep or 1))
     files = sorted(folder.glob('memory-*.db'), key=lambda item: item.stat().st_mtime,
                    reverse=True)

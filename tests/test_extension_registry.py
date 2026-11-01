@@ -239,6 +239,17 @@ class BridgeRespectsRegistryTests(unittest.TestCase):
             self.assertEqual(spawn.call_count, 0, "全停时一个 node 进程都不该起")
         self.assertEqual(bridge._profiles()[0].get("extensionPath") or "", "")
 
+    def test_profile_report_counts_auto_discovered_disabled(self):
+        # autoDiscover 发现但 registry 未登记 = 默认停用；状态页不能把它算成能跑，
+        # 否则会出现“profiles=5、ready=true、运行期零调用”的误报。
+        bridge = self._bridge()
+        report = bridge.profile_report()
+        self.assertEqual(report["active"], [])
+        self.assertEqual({item["id"] for item in report["disabled"]},
+                         {"ext-a", "ext-b"})
+        self.assertTrue(all(item["reason"] == "扩展管理里未启用"
+                            for item in report["disabled"]))
+
     def test_enabling_one_extension_brings_its_profile_back(self):
         bridge = self._bridge()
         self.assertEqual(

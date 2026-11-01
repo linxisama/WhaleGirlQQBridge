@@ -400,6 +400,15 @@ class AgentTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job['action']['persona']['system_prompt'], PERSONA['system_prompt'])
 
 
+    async def test_recall_memory_includes_recent_session_turns(self):
+        service = ConsoleAgent(self.bot)
+        session = service.sessions.create('海边')
+        service.sessions.add_turn(session['id'], '我昨天去了海边', 'chat', '海风很大')
+        lines = service.recall_memory('海边')
+        self.assertIn('[会话]', lines)
+        self.assertIn('海边', lines)
+
+
 class ParsingTests(unittest.TestCase):
     def test_fenced_json_and_invalid_json(self):
         actions = parse_actions('```json\n{"action":{"type":"service","running":false}}\n```')

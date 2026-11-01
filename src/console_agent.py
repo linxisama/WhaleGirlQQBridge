@@ -531,6 +531,19 @@ class ConsoleAgent:
         except Exception:
             pass
         try:
+            # 控制台 Agent 的会话轮次也要能回忆：否则刚聊过的内容一问就是
+            # “还没有相关记忆”，用户会以为记忆功能完全坏了。
+            for session in self.sessions.list()[:5]:
+                for turn in self.sessions.turns(session.get('id'), 3):
+                    text = str(turn.get('prompt') or '').strip()
+                    summary = str(turn.get('summary') or '').strip()
+                    line = text if not summary else f'{text} → {summary}'
+                    if not line or (query and query not in line):
+                        continue
+                    lines.append(f'· [会话] {line[:300]}')
+        except Exception:
+            pass
+        try:
             for item in self.memory.search(query, limit=limit):
                 lines.append(f'· [统一/{item["source"]}] {item["content"]}')
         except Exception:

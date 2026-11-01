@@ -1055,30 +1055,41 @@ class QqAgentBridge(PluginBase):
         raw = str(self.get('toolAllowlist', '') or '')
         return [item.strip() for item in raw.split(',') if item.strip()]
 
-    def _registry_disabled(self, ident) -> bool:
+    def _registry_disabled(self, ident, strict: bool = True) -> bool:
         """这个扩展在 extension_registry 里是否停用（唯一权威）。
 
         兜底语义：registry 模块导入不到、状态文件读不了、或 id 为空时一律返回
         False —— 桥保持既有行为，绝不因为状态存储出问题而停止工作。
-        只管 registry 认得的扩展（登记过或能被发现到）：手写 profiles 里的历史
-        id 不在其中，继续走既有行为；市场/清单里的扩展则默认停用。
+
+        strict=True（默认）沿用扩展管理的严格口径：状态文件里没登记、但扩展目录里
+        能发现到的包也算停用。strict=False 只拦“状态文件里明确登记过且 enabled=false”
+        的扩展；手写 profiles 里的历史 id 没登记过，继续按既有行为放行。显式 profiles
+        的派发/工具面必须用 strict=False，否则 5.2.100 那种“目录里有包、profiles 是
+        手写的”配置会被误判成全停用，状态显示 ready 但运行时零调用。
         """
         ident = str(ident or '').strip()
         if not ident:
             return False
         try:
-            from ..extension_registry import is_enabled, is_known
+            from ..extension_registry import is_enabled, is_known, load
         except Exception:
             try:
-                from src.extension_registry import is_enabled, is_known
+                from src.extension_registry import is_enabled, is_known, load
             except Exception:
                 return False
         try:
-            return bool(is_known(ident, self._data_dir())) and not is_enabled(ident, self._data_dir())
+            data_dir = self._data_dir()
+            state = load(data_dir)
+            registered = state.get('extensions') if isinstance(state, dict) else {}
+            if isinstance(registered, dict) and ident in registered:
+                return not is_enabled(ident, data_dir)
+            if not strict:
+                return False
+            return bool(is_known(ident, data_dir)) and not is_enabled(ident, data_dir)
         except Exception:
             return False
 
-    def _profiles(self):
+    def _profiles(self, include_disabled: bool = False):
         base = {key: self.get(key) for key in ('hostScript', 'nodeExe', 'sourceDir', 'extensionPath',
                                                 'provider', 'hookName', 'event', 'ownerOnly',
                                                 'ownerIds', 'injectPrompt', 'timeout')}
@@ -1103,8 +1114,9 @@ class QqAgentBridge(PluginBase):
                 discovered = discover_profiles(self.get('catalogPath', ''),
                                                resolved['extensions_dir'], 8,
                                                data_dir=self._data_dir())
-                discovered = [item for item in discovered
-                              if not self._registry_disabled(_extension_id(item))]
+                if not include_disabled:
+                    discovered = [item for item in discovered
+                                  if not self._registry_disabled(_extension_id(item), strict=True)]
                 if discovered:
                     picked = []
                     chosen = set()
@@ -1116,7 +1128,9 @@ class QqAgentBridge(PluginBase):
                             chosen.add(ident)
                         picked.append(item)
                     if picked:
-                        return [{**base, **item} for item in picked]
+                        # 标记来源：autoDiscover 发现的扩展默认停用（registry 未登记），
+                        # 状态页必须按严格门禁算，不能把“发现到”当成“能跑”。
+                        return [{**base, **item, '_auto_discovered': True} for item in picked]
             return [base]
         try:
             items = json.loads(raw)
@@ -1126,12 +1140,69 @@ class QqAgentBridge(PluginBase):
             return []
         result = []
         for item in items[:8]:
-            if not isinstance(item, dict) or item.get('enabled', True) is False:
+            if not isinstance(item, dict):
+                continue
+            if item.get('enabled', True) is False and not include_disabled:
                 continue
             merged = dict(base)
             merged.update({k: item[k] for k in base if k in item})
             result.append(merged)
         return result
+
+    def _profile_disabled_reason(self, profile) -> str:
+        """返回这个 profile 不能派发的原因；空字符串表示可派发。
+
+        只做静态检查（不启 node）：配置里停用、扩展管理里登记停用、缺 provider/hook、
+        缺主人 QQ、宿主/扩展/源码路径不存在。ownerIds 的具体匹配要等消息进来才知道，
+        所以这里只检查“有没有配”，不检查“是不是这个发送者”。
+        """
+        if not isinstance(profile, dict):
+            return 'profile 格式不正确'
+        if profile.get('enabled', True) is False:
+            return 'profiles 配置里停用'
+        ident = _extension_id(profile)
+        strict = bool(profile.get('_auto_discovered'))
+        if ident and self._registry_disabled(ident, strict=strict):
+            return '扩展管理里未启用'
+        if _capability(profile) is None:
+            return '没有可执行 provider/hook'
+        if profile.get('ownerOnly', False):
+            owners = {x.strip() for x in str(profile.get('ownerIds', '') or '').split(',') if x.strip()}
+            if not owners:
+                return '没有配置主人 QQ'
+        try:
+            conf = self._settings_for(profile)
+            if not Path(str(conf.get('host_script') or '')).is_file():
+                return 'host-one.mjs 不存在'
+            extension = str(conf.get('extension') or '')
+            if extension and not Path(extension).exists():
+                return '扩展文件不存在'
+            if not Path(str(conf.get('source_dir') or '')).is_dir():
+                return 'QQ Agent 源码目录不存在'
+        except Exception:
+            pass
+        return ''
+
+    def profile_report(self) -> dict:
+        """给 bridge_status 用：可执行 profile 里哪些能跑、哪些被停用及原因。
+
+        必须用 include_disabled=True 取全量，否则 autoDiscover 会把停用扩展提前滤掉，
+        状态里只剩 active 数，用户看不出“装了 9 个为什么一个都不调用”。
+        """
+        active, disabled = [], []
+        for item in self._profiles(include_disabled=True):
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get('provider') or item.get('hookName') or '').strip():
+                continue
+            reason = self._profile_disabled_reason(item)
+            if reason:
+                disabled.append({'id': _extension_id(item),
+                                 'provider': str(item.get('provider') or item.get('hookName') or ''),
+                                 'reason': reason})
+            else:
+                active.append(item)
+        return {'active': active, 'disabled': disabled}
 
     def _event_profiles(self, message, event):
         """挑出该事件该跑的 profile；工具事件没有消息上下文，走单独的准入。"""
@@ -1145,7 +1216,7 @@ class QqAgentBridge(PluginBase):
                 continue
             # 扩展管理里停用的扩展在这里也要拦住 —— 否则"停用"只对工具面无效果对钩子面无效。
             # 语义与工具面完全一致：registry 看不见的历史手写 profile 照旧派发（is_known 语义）。
-            if self._registry_disabled(_extension_id(profile)):
+            if self._registry_disabled(_extension_id(profile), strict=False):
                 continue
             if _profile_event(profile) != event:
                 continue
@@ -1662,7 +1733,7 @@ class QqAgentBridge(PluginBase):
         # registry 是启用态的唯一权威：缓存里已停用扩展的工具一律不暴露，否则
         # 用户停用了却还能调到工具。缓存只剩停用条目时同样不回落到现枚举。
         cache = {key: dict(entry) for key, entry in raw_cache.items()
-                 if not self._registry_disabled(key)}
+                 if not self._registry_disabled(key, strict=True)}
         changed = False
         for ident, entry in cache.items():
             directory = str(entry.get('dir') or '')
@@ -1680,7 +1751,7 @@ class QqAgentBridge(PluginBase):
                 if not str(profile.get('extensionPath') or ''):
                     continue
                 # 现枚举与缓存读同一道 registry 门禁，免得冷/热两次调用给出不同答案。
-                if self._registry_disabled(_extension_id(profile)):
+                if self._registry_disabled(_extension_id(profile), strict=True):
                     continue
                 tools, _error, directory, stamp = self._profile_tools_sync(profile)
                 if tools:
@@ -1735,7 +1806,7 @@ class QqAgentBridge(PluginBase):
         # 工具全名是 <扩展 id>__<工具名>，据此直接判定归属扩展是否启用（不启动进程）。
         if '__' in str(name):
             owner = str(name).split('__')[0]
-            if self._registry_disabled(owner):
+            if self._registry_disabled(owner, strict=True):
                 return {'ok': False, 'tool': name,
                         'error': {'kind': 'disabled',
                                   'message': '扩展 %s 已停用；在「扩展管理」里启用后才能调用' % owner}}

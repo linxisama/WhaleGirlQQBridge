@@ -71,6 +71,103 @@ def smoke_enabled(env=None) -> bool:
     return bool(str(env.get('WHALE_GATEWAY_WORKER_SMOKE', '')).strip())
 
 
+PLUGIN_STORE_FILES = ('qqagent_extensions.json', 'qqagent_bridge_catalog.json')
+PLUGIN_STORE_DIRS = ('qqagent_host', 'qqagent_extensions')
+BRIDGE_PATH_KEYS = ('hostRoot', 'catalogPath', 'extensionsDir', 'sourceDir',
+                    'hostScript', 'extensionPath')
+
+
+def _merge_missing(base, extra):
+    """把 extra 里有、base 里没有的键补进 base；base 已有的一律不动。"""
+    if not isinstance(base, dict) or not isinstance(extra, dict):
+        return base
+    for key, value in extra.items():
+        if key not in base:
+            base[key] = value
+        elif isinstance(base[key], dict) and isinstance(value, dict):
+            _merge_missing(base[key], value)
+    return base
+
+
+def _rewrite_bridge_paths(settings, shared_data: Path, own_data: Path):
+    """把 qqagent_bridge 里指向共享 data 的路径改到账号自己的 data。
+
+    网关账号原来没有插件库，设置是从共享目录复制来的；路径不改的话，
+    账号自己的 hostRoot 仍然指回共享目录，等于换了个地方继续串用。
+    """
+    bridge = settings.get('qqagent_bridge') if isinstance(settings, dict) else None
+    if not isinstance(bridge, dict):
+        return settings
+    old, new = str(shared_data), str(own_data)
+    # 配置可能是手写的，正斜杠/反斜杠都见过；两种写法都要能改到，
+    # 否则 Windows 上会留下一条指回共享库的死路径。
+    pairs = [(old, new), (old.replace(os.sep, '/'), new.replace(os.sep, '/'))]
+    for key in BRIDGE_PATH_KEYS:
+        value = bridge.get(key)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        text = value.strip()
+        for source, target in pairs:
+            if text == source or text.startswith(source + '/') or text.startswith(source + os.sep):
+                bridge[key] = target + text[len(source):]
+                break
+    return settings
+
+
+def _sync_plugin_store(root: Path, user_data: Path):
+    """把用户共享插件库搬进网关账号目录（只补缺、不覆盖账号已有设置）。
+
+    5.2.105 以前 prepare 只复制 plugin_settings.json，账号目录永远没有
+    qqagent_host/qqagent_extensions 这两个 marker，QQRuntime._plugin_dir()
+    就会回退到共享库：插件设置、宿主根、扩展目录和消息库分家（问题 3/4）。
+    """
+    own_data = Path(root) / 'data'
+    own = own_data / 'qq-only'
+    shared = Path(user_data) / 'qq-only'
+    if not shared.is_dir():
+        return
+    own.mkdir(parents=True, exist_ok=True)
+    for name in PLUGIN_STORE_DIRS:
+        source = shared / name
+        if not source.is_dir():
+            continue
+        destination = own / name
+        if destination.exists():
+            continue
+        shutil.copytree(source, destination)
+    for name in PLUGIN_STORE_FILES:
+        source = shared / name
+        if source.is_file() and not (own / name).exists():
+            shutil.copy2(source, own / name)
+    source_settings = shared / 'plugin_settings.json'
+    if not source_settings.is_file():
+        return
+    destination = own / 'plugin_settings.json'
+    if destination.is_file():
+        try:
+            own_values = json.loads(destination.read_text(encoding='utf-8-sig'))
+        except Exception:
+            own_values = {}
+        try:
+            shared_values = json.loads(source_settings.read_text(encoding='utf-8-sig'))
+        except Exception:
+            shared_values = {}
+        if isinstance(own_values, dict) and isinstance(shared_values, dict):
+            _merge_missing(own_values, shared_values)
+            _rewrite_bridge_paths(own_values, shared, own)
+            destination.write_text(json.dumps(own_values, ensure_ascii=False, indent=2),
+                                   encoding='utf-8')
+    else:
+        try:
+            values = json.loads(source_settings.read_text(encoding='utf-8-sig'))
+        except Exception:
+            values = {}
+        if isinstance(values, dict):
+            _rewrite_bridge_paths(values, shared, own)
+            destination.write_text(json.dumps(values, ensure_ascii=False, indent=2),
+                                   encoding='utf-8')
+
+
 def prepare(job: dict) -> Path:
     root = Path(job['root'])
     root.mkdir(parents=True, exist_ok=True)
@@ -109,12 +206,7 @@ def prepare(job: dict) -> Path:
     local = os.environ.get('LOCALAPPDATA')
     if local:
         user_data = Path(local) / 'WhaleGirlQQ' / 'data'
-        plugin_settings = user_data / 'qq-only' / 'plugin_settings.json'
-        if plugin_settings.is_file():
-            destination = root / 'data' / 'qq-only' / 'plugin_settings.json'
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if not destination.exists():
-                shutil.copy2(plugin_settings, destination)
+        _sync_plugin_store(root, user_data)
         user_custom = Path(local) / 'WhaleGirlQQ' / 'styles' / 'custom'
         if user_custom.is_dir():
             for path in user_custom.glob('*.yaml'):

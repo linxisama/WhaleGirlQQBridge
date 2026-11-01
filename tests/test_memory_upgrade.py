@@ -93,13 +93,67 @@ class ManualSelectionTests(unittest.TestCase):
 class AutoFactTests(unittest.TestCase):
     def test_clear_self_statements_are_captured(self):
         from src.plugins.conversation_memory import auto_fact
-        for text in ('我喜欢蓝色', '我是学生', '我住在杭州', '我养了一只猫'):
+        for text in ('我喜欢蓝色', '我是学生', '我住在杭州', '我养了一只猫',
+                      '我的生日是五月一号', '我今年三十岁', '我有一个妹妹'):
             self.assertEqual(auto_fact(text), text)
 
     def test_questions_guesses_and_jokes_are_skipped(self):
         from src.plugins.conversation_memory import auto_fact
         for text in ('我喜欢猫吗', '如果我喜欢猫', '我是说这个', '我养猫吗？', '我今天很开心'):
             self.assertIsNone(auto_fact(text), text)
+
+
+class AutoRememberConfirmTests(unittest.TestCase):
+    """私聊/@ 是当面自述，直接确认；群聊未点名仍先记待复证。"""
+
+    def setUp(self):
+        self.conn = sqlite3.connect(':memory:')
+        self.state = ChatState(self.conn)
+        from src.plugins.conversation_memory import ConversationMemory
+
+        class Manager:
+            _settings = {'conversation_memory': {
+                'enabled': True, 'autoRemember': True, 'recallLimit': 5,
+                'maxEntries': 500}}
+
+            def get_settings(self, plugin_id):
+                return dict(self._settings[plugin_id])
+
+        self.plugin = ConversationMemory(Manager())
+
+        class Runtime:
+            mode = 'qq'
+            chat_state = self.state
+
+            def account(self):
+                return '10000'
+
+        self.runtime = Runtime()
+
+    def tearDown(self):
+        self.conn.close()
+
+    def ingest(self, **message):
+        payload = {'kind': 'private', 'target': '999', 'sender_id': '999',
+                   'text': '我的生日是五月一号', 'id': 'm1'}
+        payload.update(message)
+        self.plugin.on_ingest(payload, self.runtime)
+
+    def status(self):
+        row = self.conn.execute('SELECT status FROM chat_memories').fetchone()
+        return row[0] if row else ''
+
+    def test_private_statement_is_confirmed(self):
+        self.ingest()
+        self.assertEqual(self.status(), 'confirmed')
+
+    def test_group_without_at_stays_candidate(self):
+        self.ingest(kind='group', target='12345', text='我今年三十岁', id='m2')
+        self.assertEqual(self.status(), 'candidate')
+
+    def test_group_at_is_confirmed(self):
+        self.ingest(kind='group', target='12345', text='我有一个妹妹', id='m3', at=True)
+        self.assertEqual(self.status(), 'confirmed')
 
 
 class MemoryMaintainApiTests(unittest.TestCase):

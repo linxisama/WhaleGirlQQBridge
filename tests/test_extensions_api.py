@@ -401,6 +401,36 @@ class ExtensionsApiTests(unittest.TestCase):
 
 
 
+    # ── /api/qqagent/extensions 兼容层（外部控制 API 用）────────────────
+    def test_qqagent_extensions_get_includes_enabled_state(self):
+        body = self._client().get("/api/qqagent/extensions").json()
+        self.assertTrue(body["success"])
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["count"], 2)
+        items = {item["id"]: item for item in body["items"]}
+        self.assertIn("enabled", items["ext-a"])
+        self.assertIn("known", items["ext-a"])
+        self.assertFalse(items["ext-a"]["enabled"])
+        self.assertIn("summary", body)
+
+    def test_qqagent_extensions_post_enable_toggle_and_state(self):
+        client = self._client()
+        posted = client.post("/api/qqagent/extensions/ext-a/enable")
+        self.assertEqual(posted.status_code, 200, posted.text)
+        self.assertTrue(posted.json()["enabled"])
+        state = json.loads(self._state_file().read_text(encoding="utf-8"))
+        self.assertTrue(state["extensions"]["ext-a"]["enabled"])
+
+        toggled = client.post("/api/qqagent/extensions/ext-a/toggle")
+        self.assertEqual(toggled.status_code, 200, toggled.text)
+        self.assertFalse(toggled.json()["enabled"])
+
+        stated = client.post("/api/extensions/ext-b", json={"state": "启用"})
+        self.assertEqual(stated.status_code, 200, stated.text)
+        self.assertTrue(stated.json()["enabled"])
+        detail = client.get("/api/qqagent/extensions/ext-b").json()
+        self.assertTrue(detail["item"]["enabled"])
+
 class InstallLocalBatchPluginsDirTests(unittest.TestCase):
     """回归：install-local-batch 曾漏传 plugins_dir，existing 恒 False、覆盖提示永不出现。"""
 

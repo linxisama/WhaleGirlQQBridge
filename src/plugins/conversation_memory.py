@@ -5,7 +5,8 @@ from ..chat_state import scope_of, person_of, quoted_context, memory_similarity
 
 
 AUTO_FACT = re.compile(
-    r'我(?:喜欢|不喜欢|讨厌|叫|的昵称是|是|在|住|养|玩|学|上班|来自|的爱好是|平时|最近在|正在学|家里有|有个)'
+    r'我(?:喜欢|不喜欢|讨厌|叫|的昵称是|的(?:生日|名字|昵称|年龄|职业|工作|学校|专业|爱好|兴趣|家乡|城市|住址|电话|微信|QQ|游戏|宠物|家人|朋友)(?:是|叫|在|有|为)?|'
+    r'是|在|住|养|玩|学|上班|来自|的爱好是|平时|最近在|正在学|家里有|有个|有一个|今年|去年|明年|养了|住在)'
     r'[^\n。！？!?]{1,70}[。！!~～]?')
 
 
@@ -87,7 +88,11 @@ class ConversationMemory(PluginBase):
                 # 说过才升级为长期记忆，避免模型/口嗨被永久记住。
                 fact = auto_fact(text)
                 if fact:
+                    # 私聊或群里 @ 机器人是"当面说的"，直接算确认事实；群聊里没点名的
+                    # 自述仍先记待复证，避免把别人的闲聊当成主人的偏好。
+                    direct = message.get('kind') == 'private' or bool(message.get('at'))
                     state.remember(scope, subject, fact, message['id'],
+                                   confirmed=direct,
                                    maximum=int(self.get('maxEntries', 500)))
         except ValueError as exc:
             return str(exc) if text.startswith(('/', '记住')) else None

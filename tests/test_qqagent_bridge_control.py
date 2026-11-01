@@ -9,16 +9,22 @@ from src.qqagent_bridge_control import bridge_status, set_bridge_enabled
 
 
 class FakeBridge:
-    def __init__(self, profiles):
+    def __init__(self, profiles, report=None):
         self.profiles = profiles
+        self.report = report
 
-    def _profiles(self):
+    def _profiles(self, include_disabled=False):
         return list(self.profiles)
+
+    def profile_report(self):
+        if self.report is None:
+            raise AttributeError("profile_report")
+        return dict(self.report)
 
 
 class FakeManager:
-    def __init__(self, settings, profiles=()):
-        self._plugins = {"qqagent_bridge": FakeBridge(profiles)}
+    def __init__(self, settings, profiles=(), report=None):
+        self._plugins = {"qqagent_bridge": FakeBridge(profiles, report)}
         self.settings = dict(settings)
         self.updates = []
 
@@ -132,6 +138,26 @@ class BridgeControlTests(unittest.TestCase):
         got = client.get("/api/qqagent/bridge/status")
         self.assertEqual(got.status_code, 200, got.text)
         self.assertTrue(got.json()["success"])
+
+    def test_all_disabled_profiles_are_reported_not_ready(self):
+        report = {
+            "active": [],
+            "disabled": [
+                {"id": "ext-a", "provider": "message.owner-check",
+                 "reason": "扩展管理里未启用"},
+            ],
+        }
+        manager = FakeManager(self.settings(), [self.profile], report=report)
+        status = bridge_status(manager)
+        self.assertEqual(status["profiles"], 1)
+        self.assertEqual(status["activeProfiles"], 0)
+        self.assertEqual(status["disabledProfiles"], 1)
+        self.assertEqual(status["disabledReasons"][0]["reason"], "扩展管理里未启用")
+        self.assertFalse(status["ready"])
+        self.assertIn("1 个已配置，但全部被停用", "".join(status["missing"]))
+        with self.assertRaisesRegex(ValueError, "全部被停用"):
+            set_bridge_enabled(manager, True, confirmed=True)
+        self.assertFalse(manager.updates)
 
     def test_profiles_without_provider_do_not_count(self):
         manager = FakeManager(self.settings(), [{"provider": "", "hookName": ""}])

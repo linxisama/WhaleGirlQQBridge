@@ -27,9 +27,16 @@ def _path(value, kind: str) -> Path | None:
 
 
 def _profiles(bridge) -> list[dict]:
-    """取已配置 profile；只统计真正带 provider/hook 的条目。"""
+    """取已配置 profile；只统计真正带 provider/hook 的条目。
+
+    优先要全量（include_disabled=True）：状态页要能告诉用户“配了 5 个、5 个都停用”，
+    不能像旧实现那样被 autoDiscover 提前滤掉，最后只剩一个 profiles=5/ready=true 的假象。
+    """
     try:
-        values = bridge._profiles()
+        try:
+            values = bridge._profiles(include_disabled=True)
+        except TypeError:
+            values = bridge._profiles()
     except Exception:
         return []
     result = []
@@ -59,6 +66,17 @@ def bridge_status(manager) -> dict:
     owners = [part for part in str(settings.get("ownerIds") or "").split(",")
               if part.strip()]
     profile_items = _profiles(bridge)
+    try:
+        report = bridge.profile_report()
+    except Exception:
+        report = {}
+    active_items = report.get("active") if isinstance(report, dict) else None
+    disabled_items = report.get("disabled") if isinstance(report, dict) else None
+    active_items = [item for item in (active_items or []) if isinstance(item, dict)]
+    disabled_items = [item for item in (disabled_items or []) if isinstance(item, dict)]
+    if not isinstance(report, dict) or not report:
+        # 旧版/测试替身没有 profile_report：按“全部可派发”处理，保持兼容。
+        active_items, disabled_items = list(profile_items), []
     node = qqagent_host.node_info(settings.get("nodeExe") or "")
     missing = []
     if not node.get("ok"):
@@ -75,13 +93,20 @@ def bridge_status(manager) -> dict:
         missing.append("主人 QQ")
     if not profile_items:
         missing.append("可执行扩展（白名单 provider）")
+    elif not active_items:
+        missing.append("可执行扩展（%d 个已配置，但全部被停用）" % len(profile_items))
     return {
         "loaded": True,
         "enabled": bool(settings.get("enabled", False)),
         "ready": not missing,
         "profiles": len(profile_items),
+        "activeProfiles": len(active_items),
+        "disabledProfiles": len(disabled_items),
+        "disabledReasons": disabled_items[:20],
         "providers": sorted({str(item.get("provider") or item.get("hookName"))
                              for item in profile_items}),
+        "activeProviders": sorted({str(item.get("provider") or item.get("hookName"))
+                                   for item in active_items}),
         "missing": missing,
         "hostScript": str(host or ""),
         "sourceDir": str(source or ""),

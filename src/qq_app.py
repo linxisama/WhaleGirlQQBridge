@@ -5379,11 +5379,21 @@ def create_app(runtime=None):
         except Exception as exc:
             raise HTTPException(400, f"能力桥切换失败：{safe_error(exc)}") from None
 
-    @app.get("/api/qqagent/extensions")
-    async def qqagent_extensions():
-        manager = app.state.bot.plugins
-        items = await asyncio.to_thread(qqagent_market.list_extensions, manager.data_dir)
-        return {"success": True, "items": items}
+    @app.api_route("/api/qqagent/extensions", methods=["GET", "POST"])
+    async def qqagent_extensions(request: Request):
+        """已装扩展列表（带启用态/门禁），兼容外部客户端 GET 与 POST 两种读法。"""
+        body = await _extensions_body(request)
+        layer, needle = _extensions_filters(request, body)
+        data_dir = _extensions_data_dir()
+        refresh = bool(body.get("refresh"))
+        try:
+            items = await asyncio.to_thread(
+                _gated_extensions, data_dir, refresh, layer, needle)
+            summary = await asyncio.to_thread(extension_registry.summary, data_dir, refresh)
+        except Exception as exc:
+            raise HTTPException(400, f"扩展列表读取失败：{safe_error(exc)}") from None
+        return {"success": True, "ok": True, "count": len(items),
+                "items": items, "summary": summary}
 
     # ── 扩展管理（WP3）：启用态唯一权威 = src/extension_registry.py ──────────
     def _extensions_manager():
@@ -5442,7 +5452,11 @@ def create_app(runtime=None):
         gated = []
         for item in items or []:
             entry = dict(item) if isinstance(item, dict) else {}
-            entry["bridgeGate"] = _extension_gate(entry, data_dir)
+            gate = _extension_gate(entry, data_dir)
+            entry["bridgeGate"] = gate
+            entry["known"] = gate["known"]
+            entry["enabled"] = gate["enabled"]
+            entry["blockedBy"] = gate["blockedBy"]
             gated.append(entry)
         return gated
 
@@ -5816,6 +5830,74 @@ def create_app(runtime=None):
                 "hostEnabled": host.get("hostEnabled") or {},
                 "ownerSeed": host.get("ownerSeed") or {},
                 "message": message}
+
+    # ── 扩展启停兼容路由（外部控制端用）────────────────────────────────────
+    def _extension_toggle_value(body: dict, action: str = ""):
+        """从 body/动作名解析目标启用态；None 表示 toggle（取反）或未表态。"""
+        act = str(action or "").strip().lower()
+        if act in ("enable", "enabled", "on", "true", "1"):
+            return True
+        if act in ("disable", "disabled", "off", "false", "0"):
+            return False
+        if act in ("toggle", "switch"):
+            return None
+        for key in ("enabled", "enable"):
+            value = body.get(key)
+            if isinstance(value, bool):
+                return value
+        value = body.get("state")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            text = value.strip().lower()
+            if text in ("enable", "enabled", "on", "true", "1", "启用", "开启"):
+                return True
+            if text in ("disable", "disabled", "off", "false", "0", "停用", "关闭"):
+                return False
+        return None
+
+    async def _extension_toggle(ident: str, request: Request, action: str = ""):
+        ident = str(ident or "").strip()
+        if not ident:
+            raise HTTPException(400, "缺少扩展 id")
+        body = await _extensions_body(request)
+        data_dir = _extensions_data_dir()
+        target = _extension_toggle_value(body, action)
+        try:
+            if target is None:
+                target = not bool(extension_registry.is_enabled(ident, data_dir))
+            entry = await asyncio.to_thread(
+                extension_registry.set_enabled, ident, target, data_dir)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+        except Exception as exc:
+            raise HTTPException(400, f"扩展启用态保存失败：{safe_error(exc)}") from None
+        return {"success": True, "ok": True, "id": ident, "enabled": bool(target),
+                "item": entry,
+                "message": ("已启用 %s" if target else "已停用 %s") % ident}
+
+    @app.get("/api/qqagent/extensions/{ident}")
+    @app.get("/api/extensions/{ident}")
+    async def extension_detail(ident: str):
+        data_dir = _extensions_data_dir()
+        try:
+            items = await asyncio.to_thread(_gated_extensions, data_dir, False)
+        except Exception as exc:
+            raise HTTPException(400, f"扩展列表读取失败：{safe_error(exc)}") from None
+        item = next((one for one in items if str(one.get("id") or "") == ident), None)
+        if item is None:
+            raise HTTPException(404, "没有这个扩展：%s" % ident)
+        return {"success": True, "ok": True, "item": item}
+
+    @app.post("/api/qqagent/extensions/{ident}")
+    @app.post("/api/extensions/{ident}")
+    async def extension_set_enabled(ident: str, request: Request):
+        return await _extension_toggle(ident, request)
+
+    @app.post("/api/qqagent/extensions/{ident}/{action}")
+    @app.post("/api/extensions/{ident}/{action}")
+    async def extension_set_enabled_action(ident: str, action: str, request: Request):
+        return await _extension_toggle(ident, request, action)
 
     # ── skill 市场（WP12b）：读端点 GET+POST 双挂，全部走 to_thread ────────────
     def _skills_runtime():
