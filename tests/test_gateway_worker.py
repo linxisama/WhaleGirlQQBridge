@@ -287,6 +287,34 @@ class GatewayPluginStoreTests(unittest.TestCase):
             self.assertTrue(saved['ownOnly']['keep'])
             self.assertTrue(saved['sharedOnly']['added'])
 
+    def test_prepare_repairs_partial_own_host_without_overwriting_user_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            shared = self._shared(base)
+            root = base / 'bot'
+            own_host = root / 'data' / 'qq-only' / 'qqagent_host'
+            own_host.mkdir(parents=True)
+            own_ext = own_host / 'plugins' / 'ext-b'
+            own_ext.mkdir(parents=True)
+            (own_ext / 'user.txt').write_text('keep', encoding='utf-8')
+            with mock.patch.dict(os.environ, {'LOCALAPPDATA': str(base / 'local')}):
+                gateway_worker.prepare(self._job(root))
+            self.assertTrue((own_host / 'src' / 'config.js').is_file())
+            self.assertTrue((own_host / 'src' / 'plugin-loader.js').is_file())
+            self.assertTrue((own_host / 'host-one.mjs').is_file())
+            self.assertEqual((own_ext / 'user.txt').read_text(encoding='utf-8'), 'keep')
+            self.assertTrue((own_host / 'plugins' / 'ext-a' / 'plugin.json').is_file())
+
+    def test_prepare_bootstraps_host_without_shared_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            root = base / 'bot'
+            with mock.patch.dict(os.environ, {'LOCALAPPDATA': str(base / 'empty-local')}):
+                gateway_worker.prepare(self._job(root))
+            host = root / 'data' / 'qq-only' / 'qqagent_host'
+            self.assertTrue((host / 'src' / 'config.js').is_file())
+            self.assertTrue((host / 'src' / 'plugin-loader.js').is_file())
+            self.assertTrue((host / 'host-one.mjs').is_file())
 
 
 if __name__ == '__main__':

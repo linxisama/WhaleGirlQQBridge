@@ -4407,7 +4407,7 @@ def create_app(runtime=None):
             return JSONResponse({'success': False, 'code': 'MODE_NOT_ONEBOT',
                                  'message': '当前是官方机器人模式，OneBot 动作不可用'},
                                 status_code=409)
-        transport = getattr(bot, 'onebot', None)
+        transport = getattr(bot, 'bridge' if mode == 'qqbridge' else 'onebot', None)
         if transport is None:
             return JSONResponse({'success': False, 'code': 'ONEBOT_NOT_READY',
                                  'message': 'OneBot 通道还没连接'}, status_code=409)
@@ -4459,7 +4459,7 @@ def create_app(runtime=None):
         if mode not in ('onebot', 'qqbridge'):
             return JSONResponse({'success': False, 'code': 'MODE_NOT_ONEBOT',
                                  'message': '当前是官方机器人模式，多媒体发送不可用'}, status_code=409)
-        transport = getattr(bot, 'onebot', None)
+        transport = getattr(bot, 'bridge' if mode == 'qqbridge' else 'onebot', None)
         if transport is None:
             return JSONResponse({'success': False, 'code': 'ONEBOT_NOT_READY',
                                  'message': 'OneBot 通道还没连接'}, status_code=409)

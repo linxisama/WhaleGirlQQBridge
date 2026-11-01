@@ -23,6 +23,7 @@ class _StubOneBot:
 class _StubBot:
     def __init__(self, mode='qqbridge'):
         self.onebot = _StubOneBot()
+        self.bridge = _StubOneBot()
 
         class _Config:
             @staticmethod
@@ -53,7 +54,7 @@ class FeatureApiTests(unittest.TestCase):
                                     json={'action': 'delete_msg', 'params': {'message_id': 7}})
         self.assertEqual(response.status_code, 200, response.text)
         self.assertTrue(response.json()['success'])
-        self.assertEqual(self.bot.onebot.calls[0], ('delete_msg', {'message_id': 7}))
+        self.assertEqual(self.bot.bridge.calls[0], ('delete_msg', {'message_id': 7}))
 
     def test_action_not_in_whitelist_is_403(self):
         response = self.client.post('/api/onebot/action',
@@ -73,7 +74,7 @@ class FeatureApiTests(unittest.TestCase):
 
     def test_upstream_error_maps_to_502(self):
         self.app.state.bot = _StubBot()
-        self.app.state.bot.onebot.fail = True
+        self.app.state.bot.bridge.fail = True
         response = self.client.post('/api/onebot/action',
                                     json={'action': 'get_status', 'params': {}})
         self.assertEqual(response.status_code, 502)

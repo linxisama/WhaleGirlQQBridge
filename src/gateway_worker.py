@@ -19,6 +19,8 @@ from pathlib import Path
 
 import yaml
 
+from . import qqagent_host
+
 # 和 src/app_log.py 的落盘约定一致：<data_dir>/qq-only/logs
 LOG_PARTS = ('data', 'qq-only', 'logs')
 
@@ -114,31 +116,58 @@ def _rewrite_bridge_paths(settings, shared_data: Path, own_data: Path):
     return settings
 
 
+def _copy_missing_tree(source: Path, destination: Path):
+    """逐文件补齐 source 里有、destination 里缺的文件；不改用户已改过的文件。"""
+    if not source.is_dir():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    for path in source.rglob('*'):
+        target = destination / path.relative_to(source)
+        try:
+            if path.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            elif path.is_file() and not target.exists():
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+        except OSError:
+            # 一个文件补不上不能拖死整个账号启动；后续 bridge/materialize 还会再报。
+            continue
+
+
 def _sync_plugin_store(root: Path, user_data: Path):
     """把用户共享插件库搬进网关账号目录（只补缺、不覆盖账号已有设置）。
 
     5.2.105 以前 prepare 只复制 plugin_settings.json，账号目录永远没有
     qqagent_host/qqagent_extensions 这两个 marker，QQRuntime._plugin_dir()
-    就会回退到共享库：插件设置、宿主根、扩展目录和消息库分家（问题 3/4）。
+    就会回退到共享库：插件设置、宿主根、扩展目录和消息库分家。
+    现在目标目录已存在时也逐文件补齐；共享库缺失时还能从随包
+    runtime/qqagent-host 兜底，避免“装完没有宿主、发不出图”这种半残状态。
     """
     own_data = Path(root) / 'data'
     own = own_data / 'qq-only'
     shared = Path(user_data) / 'qq-only'
-    if not shared.is_dir():
-        return
     own.mkdir(parents=True, exist_ok=True)
     for name in PLUGIN_STORE_DIRS:
         source = shared / name
-        if not source.is_dir():
-            continue
-        destination = own / name
-        if destination.exists():
-            continue
-        shutil.copytree(source, destination)
+        if source.is_dir():
+            _copy_missing_tree(source, own / name)
     for name in PLUGIN_STORE_FILES:
         source = shared / name
         if source.is_file() and not (own / name).exists():
             shutil.copy2(source, own / name)
+    # 宿主根是产品自带的运行时；哪怕共享库不存在，也要给账号补出
+    # host-one.mjs + src/plugin-loader.js，不然扩展全停、媒体和工具都用不了。
+    host_root = own / 'qqagent_host'
+    if not qqagent_host.is_host_root(host_root):
+        try:
+            outcome = qqagent_host.ensure_host_root(target=host_root,
+                                                    source=shared / 'qqagent_host' if (shared / 'qqagent_host').is_dir() else None,
+                                                    smoke=False)
+            if not outcome.get('ok'):
+                qqagent_host.ensure_host_root(target=host_root, smoke=False)
+        except Exception:
+            # 这里只做兜底；真正的错误由桥状态和扩展探测继续暴露。
+            pass
     source_settings = shared / 'plugin_settings.json'
     if not source_settings.is_file():
         return

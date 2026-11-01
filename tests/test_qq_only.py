@@ -264,6 +264,22 @@ class AsyncTests(IsolatedRuntime, unittest.IsolatedAsyncioTestCase):
         args=bridge.call.call_args.args
         self.assertEqual(args[1]["message"],[{"type":"text","data":{"text":"[CQ:at,qq=all]"}}])
 
+    async def test_onebot_media_meta_becomes_segments(self):
+        bridge=self.bot.onebot
+        bridge.online=True
+        bridge.call=AsyncMock(return_value={})
+        meta={'media':[{'type':'image','data':{'file':'base64://aGk=','sub_type':1,'summary':'[动画表情]'}},
+                       {'type':'face','data':{'id':'14'}}]}
+        await bridge.send({"kind":"group","target":"123"},"给你～",meta)
+        args=bridge.call.call_args.args
+        self.assertEqual(args[0],"send_group_msg")
+        self.assertEqual(args[1]["group_id"],123)
+        self.assertEqual(args[1]["message"][0]["type"],"text")
+        self.assertEqual(args[1]["message"][1]["type"],"image")
+        self.assertEqual(args[1]["message"][1]["data"]["file"],"base64://aGk=")
+        self.assertEqual(args[1]["message"][1]["data"]["sub_type"],1)
+        self.assertEqual(args[1]["message"][2]["type"],"face")
+
     async def test_onebot_self_messages_ignored(self):
         self.assertIsNone(onebot_message({"post_type":"message","message_type":"private","user_id":42},"42"))
 

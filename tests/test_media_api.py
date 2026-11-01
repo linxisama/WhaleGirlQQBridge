@@ -23,6 +23,7 @@ class _StubOneBot:
 
 class _StubBot:
     def __init__(self, mode='qqbridge'):
+        self.bridge = _StubOneBot()
         self.onebot = _StubOneBot()
 
         class _Config:
@@ -55,7 +56,7 @@ class MediaApiTests(unittest.TestCase):
             'target_type': 'group', 'target_id': '555',
             'kind': 'image', 'path': str(self.image)})
         self.assertEqual(response.status_code, 200, response.text)
-        action, params = self.bot.onebot.calls[0]
+        action, params = self.bot.bridge.calls[0]
         self.assertEqual(action, 'send_group_msg')
         self.assertEqual(params['group_id'], 555)
         segment = params['message'][0]
@@ -69,7 +70,7 @@ class MediaApiTests(unittest.TestCase):
             'target_type': 'private', 'target_id': '10001',
             'kind': 'file', 'path': str(self.image), 'name': '报告.png'})
         self.assertEqual(response.status_code, 200, response.text)
-        action, params = self.bot.onebot.calls[0]
+        action, params = self.bot.bridge.calls[0]
         self.assertEqual(action, 'send_private_msg')
         self.assertEqual(params['user_id'], 10001)
         self.assertEqual(params['message'][0]['data']['name'], '报告.png')
@@ -79,7 +80,7 @@ class MediaApiTests(unittest.TestCase):
             'target_type': 'group', 'target_id': '555', 'kind': 'image',
             'url': 'https://example.com/x.png'})
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.bot.onebot.calls[0][1]['message'][0]['data']['file'],
+        self.assertEqual(self.bot.bridge.calls[0][1]['message'][0]['data']['file'],
                          'https://example.com/x.png')
 
     def test_missing_file_is_422(self):
@@ -105,11 +106,29 @@ class MediaApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
 
     def test_upstream_error_is_502(self):
-        self.bot.onebot.fail = True
+        self.bot.bridge.fail = True
         response = self.client.post('/api/media/send', json={
             'target_type': 'group', 'target_id': '1', 'kind': 'image',
             'url': 'https://x'})
         self.assertEqual(response.status_code, 502)
+
+    def test_onebot_mode_uses_onebot_transport(self):
+        self.bot = _StubBot(mode='onebot')
+        self.app.state.bot = self.bot
+        response = self.client.post('/api/media/send', json={
+            'target_type': 'group', 'target_id': '555', 'kind': 'image',
+            'url': 'https://example.com/x.png'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.bot.onebot.calls[0][0], 'send_group_msg')
+        self.assertEqual(self.bot.bridge.calls, [])
+
+    def test_onebot_action_uses_bridge_in_qqbridge_mode(self):
+        response = self.client.post('/api/onebot/action', json={
+            'action': 'send_group_msg',
+            'params': {'group_id': 555, 'message': 'hi'}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.bot.bridge.calls[0][0], 'send_group_msg')
+        self.assertEqual(self.bot.onebot.calls, [])
 
 
 if __name__ == '__main__':
