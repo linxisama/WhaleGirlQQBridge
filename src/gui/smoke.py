@@ -380,7 +380,7 @@ def run(gui, output, *, native=False):
                 cache={path:(await client.get('/api/'+path)).json() for path in ('persona-bindings','command-catalog','group-diagnostics')}
                 assert any(item['command']=='/菜单' for item in cache['command-catalog']['commands'])
                 return cache
-        # 安装包只带基础插件；依赖市场插件（archive_isolation）的页面检查在有它时才跑。
+        # 安装包现在把 archive_isolation 作为基础插件；页面检查仍按运行时有它才跑，兼容老版本。
         has_bindings = 'archive_isolation' in getattr(runtime.plugins, '_plugins', {})
         if has_bindings:
             feature_cache=asyncio.run(bindings_check())

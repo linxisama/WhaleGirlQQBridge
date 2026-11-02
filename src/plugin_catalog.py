@@ -7,7 +7,7 @@ from __future__ import annotations
 
 # 只保留聊天主链路必需、或用户明确要求默认提供的能力。
 BASIC_PLUGINS = (
-    'addressee_guard', 'ambient_reply', 'anti_repeat', 'burst_merge',
+    'addressee_guard', 'ambient_reply', 'anti_repeat', 'burst_merge', 'archive_isolation',
     'chat_controls', 'conversation_memory', 'face_decode', 'forward_summary',
     'image_understanding', 'keyword_reply', 'mention_nudge_guard', 'pc_control', 'quick_menu',
     'quote_reply', 'reply_variety', 'send_pacing', 'short_followup',

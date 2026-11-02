@@ -40,8 +40,8 @@ class PluginCatalogTests(unittest.TestCase):
         for plugin_id in basic | market:
             self.assertTrue((Path(__file__).resolve().parents[1] / 'src' / 'plugins'
                              / f'{plugin_id}.py').is_file(), plugin_id)
-        self.assertEqual(len(basic), 21)
-        self.assertEqual(len(market), 42)
+        self.assertEqual(len(basic), 22)
+        self.assertEqual(len(market), 41)
 
     def test_basic_keeps_core_chat_and_memory(self):
         for required in ('conversation_memory', 'image_understanding', 'token_saver',

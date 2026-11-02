@@ -21,8 +21,8 @@ GENERATOR = ROOT / ".build-tools" / "make_version_file.py"
 BUILD_SCRIPT = ROOT / "build_installer.ps1"
 INSTALLER_SCRIPT = ROOT / "installer.iss"
 
-VERSION = "5.2.108"
-FULL_VERSION = "5.2.108.0"
+VERSION = "5.2.109"
+FULL_VERSION = "5.2.109.0"
 PRODUCT_NAME = "鲸鱼娘 QQ 账号版"
 ORIGINAL_FILENAME = "WhaleGirlQQBridge.exe"
 REQUIRED_FIELDS = (
