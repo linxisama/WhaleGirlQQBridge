@@ -32,6 +32,13 @@ HIDDEN = [
 ]
 
 
+def plugin_core_submodules() -> list:
+    """收集根包 plugin_core 的子模块（内核被 src.plugin_core_bridge 静态引用）。"""
+    sys.path.insert(0, str(ROOT))
+    from PyInstaller.utils.hooks import collect_submodules
+    return [name for name in collect_submodules("plugin_core") if ".tests" not in name]
+
+
 def src_submodules() -> list:
     """收集 ``src`` 下所有子模块。
 
@@ -74,7 +81,7 @@ def main() -> int:
         "--add-data", f"{ROOT / 'assets/icon-map.json'};assets/icon-map.json",
         "--icon", str(icon) if icon.exists() else "NONE",
     ]
-    for item in list(HIDDEN) + sorted(submodules):
+    for item in list(HIDDEN) + sorted(submodules) + sorted(plugin_core_submodules()):
         cmd += ["--hidden-import", item]
     cmd.append(str(ROOT / "qq_gui.py"))
 

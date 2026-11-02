@@ -608,6 +608,13 @@ class QQRuntime:
         plugin_dir = self.data_root or self._plugin_dir()
         plugin_dir.mkdir(parents=True, exist_ok=True)
         self.plugins = PluginManager(plugin_dir)
+        # plugin_core 内核（目录式插件）：空目录不启动；初始化失败不阻塞普通插件和 AI。
+        try:
+            from .plugin_core_bridge import PluginCoreBridge
+            self.plugin_core = PluginCoreBridge(plugin_dir / "plugin_core", self)
+        except Exception as exc:
+            self.plugin_core = None
+            logger.warning("插件内核初始化跳过：{}", exc)
         # 按次计费（中转站每次请求固定扣费）：插件层要知道，才能跳过"可选的第二次调用"、
         # 放宽多消息合并窗口。必须放在 plugins 创建之后（之前放在 style.load_all() 前面，
         # 那时 self.plugins 还不存在，直接 AttributeError 把启动打挂）。
@@ -1539,6 +1546,13 @@ class QQRuntime:
         if self.mode == "qqbridge" and not str(self.bridge.ws_url or "").strip():
             raise ValueError("请先在「设置 → QQ 接入」填入 SnowLuma OneBot 的 WebSocket 地址（如 ws://127.0.0.1:3001）")
         self.running = True
+        if self.plugin_core is not None:
+            try:
+                _core = await asyncio.wait_for(self.plugin_core.start_async(), timeout=20)
+                if _core.get("plugins"):
+                    self.note("插件内核已加载 %d 个插件" % len(_core["plugins"]))
+            except Exception as exc:
+                self.note("插件内核启动失败，普通插件与 AI 仍可用：%s" % safe_error(exc))
         self.worker = asyncio.create_task(self._work())
         self.health = asyncio.create_task(self._health())
         self.plugin_ticker = asyncio.create_task(self._plugin_tick())
@@ -2009,6 +2023,11 @@ class QQRuntime:
         self.observer=None
         self.bridge_task=None
         self.plugins.cancel_background()
+        if self.plugin_core is not None:
+            try:
+                await self.plugin_core.close_async()
+            except Exception as exc:
+                self.note("插件内核关闭时出错：%s" % safe_error(exc))
         while not self.observations.empty():
             self.observations.get_nowait();self.observations.task_done()
         await self.onebot.close()
@@ -2279,6 +2298,63 @@ class QQRuntime:
             if not status.done():
                 status.cancel()
 
+    async def _run_plugin_core(self, key, message, room):
+        """给 plugin_core 一次认领机会；返回 True 表示内核已处理（可能静默）。"""
+        core = getattr(self, "plugin_core", None)
+        if core is None or not core.available:
+            return False
+        try:
+            record = await asyncio.to_thread(core.handle, message)
+        except Exception as exc:
+            self.note("插件内核处理失败，已回退普通回复：%s" % safe_error(exc))
+            return False
+        if not isinstance(record, dict) or not record.get("bids"):
+            return False
+        from .plugin_core_bridge import media_to_reply_meta
+        sends = [item for item in (record.get("sent") or []) if isinstance(item, dict)]
+        texts = []
+        base_seq = int(message.get("_passive_seq") or 1)
+        transport = self._transport_for(message)
+        try:
+            for index, send in enumerate(sends):
+                conversation = str(send.get("conversation") or "")
+                target = dict(message)
+                if conversation.startswith("g:"):
+                    target["kind"] = "group"
+                    target["target"] = conversation[2:]
+                elif conversation.startswith("p:"):
+                    target["kind"] = "private"
+                    target["target"] = conversation[2:]
+                target["_passive_seq"] = min(5, base_seq + index)
+                text = str(send.get("text") or "")
+                media = media_to_reply_meta(send.get("media"))
+                meta = {}
+                if text:
+                    meta["text"] = text
+                if media:
+                    meta["media"] = media
+                if not text and not media:
+                    continue
+                await _send_with_pacing(transport, target, text, meta or None)
+                texts.append(text)
+        except Exception as exc:
+            self.db.execute(
+                "UPDATE inbox SET state='uncertain',reply=?,error=? WHERE key=?",
+                ("\n".join(texts), safe_error(exc), key),
+            )
+            self.db.commit()
+            self.note("插件内核回复发送失败：%s" % safe_error(exc))
+            return True
+        self.db.execute(
+            "UPDATE inbox SET state='sent',reply=?,error='' WHERE key=?",
+            ("\n".join(texts), key),
+        )
+        self.db.commit()
+        names = sorted({str(item.get("plugin") or "") for item in record.get("bids") or [] if isinstance(item, dict)})
+        label = "、".join(name for name in names if name) or "插件"
+        self.decision(message, "插件内核已处理：%s" % label)
+        return True
+
     async def _work(self):
         while self.running:
             try:
@@ -2351,6 +2427,9 @@ class QQRuntime:
                                           f"{self.style.active_name}）")
                         except Exception as _reload_exc:
                             self.note(f"人设热加载跳过：{type(_reload_exc).__name__}")
+                        if self.plugin_core is not None and self.plugin_core.available:
+                            if await self._run_plugin_core(key, message, room):
+                                continue
                         from .persona_bindings import resolve_persona
                         _persona = resolve_persona(self,message)
                         if _persona.name != self.style.active_name:
@@ -6110,6 +6189,71 @@ def create_app(runtime=None):
         manager.reload()
         return {"success": True, "message": f"插件 {plugin_id} 已删除",
                 "kind": "file", "still_loaded": plugin_id in manager._plugins}
+
+    @app.get("/api/plugin-core/status")
+    async def plugin_core_status():
+        """查看目录式插件内核（plugin_core）的加载状态。"""
+        bot = app.state.bot
+        core = getattr(bot, "plugin_core", None)
+        if core is None:
+            return {"success": True, "available": False, "started": False,
+                    "plugins": [], "refused": [], "lastError": "插件内核未初始化"}
+        payload = core.status()
+        payload["success"] = True
+        return payload
+
+    @app.post("/api/plugin-core/install")
+    async def plugin_core_install(request: Request):
+        """安装目录式 plugin_core 插件：本地目录或单插件 zip。"""
+        body = await request.json()
+        bot = app.state.bot
+        core = getattr(bot, "plugin_core", None)
+        if core is None:
+            raise HTTPException(503, "插件内核未初始化")
+        try:
+            payload = await asyncio.to_thread(
+                core.install,
+                str(body.get("path") or ""),
+                overwrite=bool(body.get("overwrite")),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, safe_error(exc)) from None
+        except Exception as exc:
+            raise HTTPException(400, safe_error(exc)) from None
+        payload["success"] = True
+        return payload
+
+    @app.post("/api/plugin-core/uninstall")
+    async def plugin_core_uninstall(request: Request):
+        """移除一个目录式 plugin_core 插件。"""
+        body = await request.json()
+        bot = app.state.bot
+        core = getattr(bot, "plugin_core", None)
+        if core is None:
+            raise HTTPException(503, "插件内核未初始化")
+        ident = str(body.get("id") or body.get("pluginId") or "")
+        try:
+            payload = await asyncio.to_thread(core.uninstall, ident)
+        except ValueError as exc:
+            raise HTTPException(400, safe_error(exc)) from None
+        except Exception as exc:
+            raise HTTPException(400, safe_error(exc)) from None
+        payload["success"] = True
+        return payload
+
+    @app.post("/api/plugin-core/reload")
+    async def plugin_core_reload():
+        """重新扫描 <数据目录>/plugin_core/plugins；不做单插件热重载。"""
+        bot = app.state.bot
+        core = getattr(bot, "plugin_core", None)
+        if core is None:
+            raise HTTPException(503, "插件内核未初始化")
+        try:
+            payload = await core.reload_async()
+        except Exception as exc:
+            raise HTTPException(400, safe_error(exc)) from None
+        payload["success"] = True
+        return payload
 
     @app.get("/api/plugins")
     async def list_plugins():

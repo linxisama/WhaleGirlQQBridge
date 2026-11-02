@@ -36,6 +36,7 @@ def collect_paths(root=ROOT):
     optional=['插件功能与接入说明.md','对话与电脑操控使用说明.md','qq_gui.py','gui_launcher.py','requirements.gui.txt','安装使用说明.txt','功能对照与使用说明.md','插件本地文件接入说明.md','icon.ico','version.txt','start-web.bat']
     paths += [root/p for p in optional if (root/p).is_file()]
     paths += [p for p in (root/'src').rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix in {'.py','.js','.html','.css','.yaml'}]
+    paths += [p for p in (root/'plugin_core').rglob('*') if p.is_file() and '__pycache__' not in p.parts and p.suffix in {'.py','.json','.md'}]
     paths += list((root/'styles').glob('*.yaml'))
     paths += [p for p in (root/'assets').rglob('*') if p.is_file() and p.suffix.lower() in {'.png','.jpg','.jpeg','.gif','.webp','.ico','.svg','.json'}]
     paths += [p for p in (root/'third_party'/'estrella').glob('*') if p.is_file() and p.name in {'LICENSE','NOTICE','SOURCE.md'}]

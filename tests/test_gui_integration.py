@@ -4,13 +4,14 @@ import copy
 import os
 import time
 import unittest
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QProgressBar, QTextEdit  # noqa: E402
 
 import qq_gui  # noqa: E402
-from qq_gui import AboutTab, PluginPacksDialog  # noqa: E402
+from qq_gui import AboutTab, PluginCoreDialog, PluginPacksDialog  # noqa: E402
 from src.gui.agent_panel import AgentBackendPanel  # noqa: E402
 
 _APP = None
@@ -181,6 +182,83 @@ class PluginPacksDialogTests(unittest.TestCase):
         dialog.pack_list.setCurrentRow(0)
         self.assertFalse(dialog.install_selected())
         self.assertIn("已安装", dialog.notice.text())
+
+
+class PluginTabCoreEntryTests(unittest.TestCase):
+    def test_plugin_tab_exposes_core_plugins_button(self):
+        app()
+        tab = qq_gui.PluginTab()
+        self.addCleanup(tab.close)
+        self.assertEqual(tab.btn_plugin_core.text(), "内核插件")
+        self.assertEqual(tab.btn_plugin_core.objectName(), "btn_plugin_core")
+
+
+class PluginCoreDialogTests(unittest.TestCase):
+    def _dialog(self, status, post_routes=None):
+        fake = FakeApi({"plugin-core/status": status}, post_routes or {})
+        dialog = PluginCoreDialog(api_get=fake.get, api_post=fake.post)
+        self.addCleanup(dialog.close)
+        self.assertTrue(pump_until(lambda: fake.gets))
+        return dialog, fake
+
+    def test_lists_core_plugins_and_installs_with_overwrite(self):
+        dialog, fake = self._dialog({
+            "success": True, "available": True, "lastError": "",
+            "plugins": [{"id": "hello", "name": "问候", "version": "1.0"}],
+        }, {
+            "plugin-core/install": {"success": True, "plugin": {"id": "hello"}},
+        })
+        self.assertTrue(pump_until(lambda: dialog.plugin_list.count() == 1))
+        self.assertIn("问候", dialog.plugin_list.item(0).text())
+        self.assertIn("hello", dialog.plugin_list.item(0).text())
+        self.assertIn("内核已启动", dialog.summary.text())
+        dialog.path.setText("C:/plugins/hello")
+        dialog.overwrite.setChecked(True)
+        self.assertTrue(dialog.install_plugin())
+        self.assertTrue(pump_until(lambda: bool(fake.posts)))
+        path, body, kwargs = fake.posts[0]
+        self.assertEqual(path, "plugin-core/install")
+        self.assertEqual(body, {"path": "C:/plugins/hello", "overwrite": True})
+        self.assertEqual(kwargs.get("timeout"), 120)
+
+    def test_uninstall_requires_confirmation_and_sends_selected_id(self):
+        dialog, fake = self._dialog({
+            "success": True, "available": True,
+            "plugins": [{"id": "hello", "name": "问候", "version": "1.0"}],
+        }, {
+            "plugin-core/uninstall": {"success": True, "id": "hello"},
+        })
+        self.assertTrue(pump_until(lambda: dialog.plugin_list.count() == 1))
+        dialog.plugin_list.setCurrentRow(0)
+        with mock.patch.object(
+                qq_gui.QMessageBox, "question",
+                return_value=qq_gui.QMessageBox.StandardButton.Yes):
+            self.assertTrue(dialog.uninstall_selected())
+        self.assertTrue(pump_until(lambda: bool(fake.posts)))
+        path, body, kwargs = fake.posts[0]
+        self.assertEqual(path, "plugin-core/uninstall")
+        self.assertEqual(body, {"id": "hello"})
+        self.assertEqual(kwargs.get("timeout"), 30)
+
+    def test_uninstall_cancelled_does_not_call_api(self):
+        dialog, fake = self._dialog({
+            "success": True, "available": True,
+            "plugins": [{"id": "hello", "name": "问候", "version": "1.0"}],
+        })
+        self.assertTrue(pump_until(lambda: dialog.plugin_list.count() == 1))
+        dialog.plugin_list.setCurrentRow(0)
+        with mock.patch.object(
+                qq_gui.QMessageBox, "question",
+                return_value=qq_gui.QMessageBox.StandardButton.No):
+            self.assertFalse(dialog.uninstall_selected())
+        app().processEvents()
+        self.assertFalse(fake.posts)
+
+    def test_empty_path_is_rejected_locally(self):
+        dialog, fake = self._dialog({"success": True, "available": False, "plugins": []})
+        self.assertFalse(dialog.install_plugin())
+        self.assertIn("请先选择", dialog.notice.text())
+        self.assertFalse(fake.posts)
 
 
 class DshConnectionReportTests(unittest.TestCase):

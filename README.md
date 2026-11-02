@@ -58,6 +58,7 @@ ai:
 - 控制台「插件 → 本地插件包」可手动安装；不会自动安装。
 - 用户插件复制到 %LOCALAPPDATA%\WhaleGirlQQ\data\custom_plugins\<id>\，停用不删文件。
 - 插件配置的文件字段会把文件复制到 data/plugin_uploads，不会自动上传公网。
+- 目录式 plugin_core 插件在控制台「插件 → 内核插件」安装/移除，格式见 plugin_core/README.md 和 docs/插件内核-API-v1.md。
 
 ## 测试
 

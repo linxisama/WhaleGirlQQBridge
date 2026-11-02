@@ -8,6 +8,7 @@ import json
 import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import httpx
@@ -270,6 +271,46 @@ class PluginPacksRouteTests(_BackendRouteTestCase):
         self.assertEqual(body['kind'], 'pack')
         self.assertEqual(body['mod'], 'demo-pack')
         self.assertFalse(folder.exists())
+
+
+class PluginCoreRouteTests(_BackendRouteTestCase):
+    async def test_install_status_reload_and_uninstall(self):
+        status = (await self.client.get('/api/plugin-core/status')).json()
+        self.assertTrue(status['success'])
+        self.assertFalse(status['available'])
+        self.assertEqual(status['plugins'], [])
+
+        source = Path(__file__).resolve().parents[1] / 'plugin_core' / 'examples' / 'hello'
+        response = await self.client.post(
+            '/api/plugin-core/install', json={'path': str(source)})
+        self.assertEqual(response.status_code, 200, response.text)
+        installed = response.json()
+        self.assertTrue(installed['success'])
+        self.assertTrue(installed['installed'])
+        self.assertEqual(installed['plugin']['id'], 'hello')
+        self.assertTrue(installed['available'])
+
+        status = (await self.client.get('/api/plugin-core/status')).json()
+        self.assertTrue(status['available'])
+        self.assertEqual([item['id'] for item in status['plugins']], ['hello'])
+
+        response = await self.client.post('/api/plugin-core/reload')
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([item['id'] for item in response.json()['plugins']], ['hello'])
+
+        response = await self.client.post(
+            '/api/plugin-core/uninstall', json={'id': 'hello'})
+        self.assertEqual(response.status_code, 200, response.text)
+        removed = response.json()
+        self.assertTrue(removed['uninstalled'])
+        self.assertFalse(removed['available'])
+        self.assertFalse((self.root / 'plugin_core' / 'plugins' / 'hello').exists())
+
+    async def test_install_missing_source_is_400(self):
+        response = await self.client.post(
+            '/api/plugin-core/install', json={'path': 'Z:/definitely-missing'})
+        self.assertEqual(response.status_code, 400, response.text)
+        self.assertIn('不存在', response.json()['detail'])
 
 
 class AutoConnectDshTests(_BackendRouteTestCase):

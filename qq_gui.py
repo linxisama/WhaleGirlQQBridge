@@ -5281,6 +5281,197 @@ class PluginPacksDialog(QDialog):
         super().closeEvent(event)
 
 
+class PluginCoreDialog(QDialog):
+    """目录式 plugin_core 插件：查看已加载插件，从本地目录或 zip 安装。"""
+
+    def __init__(self, parent=None, api_get=None, api_post=None):
+        super().__init__(parent)
+        self.setWindowTitle("目录式插件内核")
+        self.setObjectName("plugin_core_dialog")
+        self.resize(760, 560)
+        self.api_get = api_get or globals().get("api_get")
+        self.api_post = api_post or globals().get("api_post")
+        self.requests = PanelRequests(self)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+        title = QLabel("目录式插件内核")
+        title.setStyleSheet(f"font-size: 18px; font-weight: bold; color: {TEXT};")
+        root.addWidget(title)
+        hint = QLabel(
+            "这里管理 plugin_core 目录式插件（plugins/<id>/plugin.json）。"
+            "安装只复制到当前账号的数据目录，不上传、不改内置插件。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        root.addWidget(hint)
+        self.summary = QLabel("正在读取…")
+        self.summary.setObjectName("plugin_core_summary")
+        self.summary.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        root.addWidget(self.summary)
+        self.plugin_list = QListWidget()
+        self.plugin_list.setObjectName("plugin_core_list")
+        self.plugin_list.setMinimumHeight(220)
+        self.plugin_list.currentItemChanged.connect(lambda *_: self._sync_buttons())
+        root.addWidget(self.plugin_list, 1)
+        path_row = QHBoxLayout()
+        self.path = QLineEdit()
+        self.path.setObjectName("plugin_core_path")
+        self.path.setPlaceholderText("插件目录或 .zip 的完整路径")
+        path_row.addWidget(self.path, 1)
+        self.btn_dir = QPushButton("选择目录…")
+        self.btn_dir.setProperty("class", "secondary")
+        self.btn_dir.clicked.connect(self._pick_dir)
+        path_row.addWidget(self.btn_dir)
+        self.btn_zip = QPushButton("选择 zip…")
+        self.btn_zip.setProperty("class", "secondary")
+        self.btn_zip.clicked.connect(self._pick_zip)
+        path_row.addWidget(self.btn_zip)
+        root.addLayout(path_row)
+        options = QHBoxLayout()
+        self.overwrite = QCheckBox("覆盖已安装的同名插件")
+        self.overwrite.setObjectName("plugin_core_overwrite")
+        options.addWidget(self.overwrite)
+        options.addStretch(1)
+        self.btn_install = QPushButton("安装")
+        self.btn_install.setObjectName("plugin_core_install")
+        self.btn_install.clicked.connect(self.install_plugin)
+        options.addWidget(self.btn_install)
+        self.btn_uninstall = QPushButton("移除选中")
+        self.btn_uninstall.setObjectName("plugin_core_uninstall")
+        self.btn_uninstall.setProperty("class", "secondary")
+        self.btn_uninstall.clicked.connect(self.uninstall_selected)
+        options.addWidget(self.btn_uninstall)
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.setProperty("class", "secondary")
+        self.btn_refresh.clicked.connect(self.refresh)
+        options.addWidget(self.btn_refresh)
+        root.addLayout(options)
+        self.notice = QLabel("")
+        self.notice.setObjectName("plugin_core_notice")
+        self.notice.setWordWrap(True)
+        self.notice.setTextFormat(Qt.TextFormat.PlainText)
+        self.notice.setStyleSheet(f"color: {MUTED}; font-size: 12px;")
+        root.addWidget(self.notice)
+        self._sync_buttons()
+        QTimer.singleShot(0, self.refresh)
+
+    def _sync_buttons(self):
+        selected = self.plugin_list.currentItem() is not None
+        busy = bool(getattr(self.requests, "busy", False))
+        self.btn_install.setEnabled(not busy)
+        self.btn_uninstall.setEnabled(selected and not busy)
+        self.btn_refresh.setEnabled(not busy)
+
+    def refresh(self) -> None:
+        if self.requests.busy:
+            return
+        self.summary.setText("正在读取…")
+        self.requests.start(
+            lambda: self.api_get("plugin-core/status", timeout=5),
+            self._loaded, self._failed)
+
+    def _loaded(self, payload) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        if not data or data.get("success") is False:
+            self.summary.setText("读取失败")
+            self.notice.setText(str(data.get("message") or data.get("detail") or "后台未响应"))
+            self._sync_buttons()
+            return
+        plugins = data.get("plugins") if isinstance(data.get("plugins"), list) else []
+        self.plugin_list.clear()
+        for item in plugins:
+            if not isinstance(item, dict):
+                continue
+            ident = str(item.get("id") or "")
+            name = str(item.get("name") or ident)
+            version = str(item.get("version") or "")
+            row = QListWidgetItem("%s  (%s)  %s" % (name, ident, version))
+            row.setData(Qt.ItemDataRole.UserRole, ident)
+            self.plugin_list.addItem(row)
+        if data.get("available"):
+            self.summary.setText("内核已启动，已加载 %d 个插件。" % len(plugins))
+        else:
+            self.summary.setText("内核未启动：目录里还没有可加载的插件。")
+        self.notice.setText(str(data.get("lastError") or ""))
+        self._sync_buttons()
+
+    def _failed(self, exc) -> None:
+        self.summary.setText("读取失败")
+        self.notice.setText("读取插件内核状态失败：%s" % exc)
+        self._sync_buttons()
+
+    def _pick_dir(self) -> None:
+        path = file_dialogs.choose_dir(self, "选择插件目录")
+        if path:
+            self.path.setText(path)
+
+    def _pick_zip(self) -> None:
+        path, _ = file_dialogs.open_file(
+            self, "选择插件 zip", "", "插件包 (*.zip)")
+        if path:
+            self.path.setText(path)
+
+    def _selected_id(self) -> str:
+        item = self.plugin_list.currentItem()
+        return str(item.data(Qt.ItemDataRole.UserRole) or "") if item is not None else ""
+
+    def install_plugin(self) -> bool:
+        path = self.path.text().strip()
+        if not path:
+            self.notice.setText("请先选择插件目录或 zip。")
+            return False
+        body = {"path": path, "overwrite": self.overwrite.isChecked()}
+        self.notice.setText("正在安装…")
+        self._sync_buttons()
+        return self.requests.start(
+            lambda: self.api_post("plugin-core/install", body, timeout=120),
+            self._installed, self._failed)
+
+    def _installed(self, payload) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        if not data or data.get("success") is False:
+            self.notice.setText("安装失败：%s"
+                                % (data.get("message") or data.get("detail") or "未知原因"))
+            self._sync_buttons()
+            return
+        plugin = data.get("plugin") if isinstance(data.get("plugin"), dict) else {}
+        ident = str(plugin.get("id") or "")
+        self.notice.setText("已安装%s。" % ((" " + ident) if ident else "插件"))
+        QTimer.singleShot(0, self.refresh)
+
+    def uninstall_selected(self) -> bool:
+        ident = self._selected_id()
+        if not ident:
+            self.notice.setText("请先选中一个插件。")
+            return False
+        answer = QMessageBox.question(
+            self, "移除插件", "确定移除插件 %s？" % ident,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.notice.setText("正在移除…")
+        self._sync_buttons()
+        return self.requests.start(
+            lambda: self.api_post("plugin-core/uninstall", {"id": ident}, timeout=30),
+            self._uninstalled, self._failed)
+
+    def _uninstalled(self, payload) -> None:
+        data = dict(payload) if isinstance(payload, dict) else {}
+        if not data or data.get("success") is False:
+            self.notice.setText("移除失败：%s"
+                                % (data.get("message") or data.get("detail") or "未知原因"))
+            self._sync_buttons()
+            return
+        self.notice.setText("已移除插件 %s。" % str(data.get("id") or ""))
+        QTimer.singleShot(0, self.refresh)
+
+    def closeEvent(self, event):
+        if hasattr(self, "requests"):
+            self.requests.close()
+        super().closeEvent(event)
+
+
 class PluginTab(QWidget):
     """Searchable plugin catalogue with filters and confirmed toggle state."""
     CATEGORIES = {
@@ -5352,6 +5543,14 @@ class PluginTab(QWidget):
         self.btn_local_packs.clicked.connect(
             lambda: PluginPacksDialog(self, api_get, api_post).exec())
         heading.addWidget(self.btn_local_packs)
+        self.btn_plugin_core = QPushButton("内核插件")
+        self.btn_plugin_core.setObjectName("btn_plugin_core")
+        self.btn_plugin_core.setProperty("class", "secondary")
+        self.btn_plugin_core.setToolTip(
+            "目录式 plugin_core 插件：查看已加载插件，从本地目录或 zip 安装")
+        self.btn_plugin_core.clicked.connect(
+            lambda: PluginCoreDialog(self, api_get, api_post).exec())
+        heading.addWidget(self.btn_plugin_core)
         self.btn_reload = QPushButton("刷新列表")
         self.btn_reload.setProperty("class", "secondary")
         self.btn_reload.clicked.connect(self.refresh)
