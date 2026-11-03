@@ -128,7 +128,15 @@ class CommandParsingTests(unittest.TestCase):
         self.assertEqual(session_command("/帮助"), ("help", ""))
         self.assertEqual(session_command("回复记录 8"), ("replies", "8"))
         self.assertEqual(session_command("人设 傲娇鲸鱼娘"), ("persona", "傲娇鲸鱼娘"))
-        self.assertEqual(session_command("插件 关 keyword_reply"), ("plugin", "关 keyword_reply"))
+        self.assertEqual(session_command("人设：傲娇鲸鱼娘"), ("persona", "傲娇鲸鱼娘"))
+        self.assertEqual(session_command("切换人设 傲娇鲸鱼娘"), ("persona", "傲娇鲸鱼娘"))
+        self.assertEqual(session_command("切换人格"), ("persona", ""))
+        self.assertEqual(session_command("切换成默认人格"), ("persona", "默认人格"))
+        self.assertEqual(session_command("切换成默认"), ("persona", "默认"))
+        self.assertEqual(session_command("换一个人设：傲娇鲸鱼娘"), ("persona", "傲娇鲸鱼娘"))
+        self.assertEqual(session_command("人格　傲娇鲸鱼娘"), ("persona", "傲娇鲸鱼娘"))
+        self.assertEqual(session_command("插件：关 keyword_reply"), ("plugin", "关 keyword_reply"))
+        self.assertEqual(session_command("状态："), ("status", ""))
         self.assertEqual(session_command("重试失败"), ("retry_failed", ""))
         self.assertIsNone(session_command("今天天气不错"))
 
@@ -296,6 +304,13 @@ class AdminModeEndToEndTests(unittest.TestCase):
         reply, _ = self.send("人设 不存在的名字")
         self.assertIn("不存在", reply)
 
+        reply, _ = self.send("切换成默认人格")
+        self.assertIn("已切换人设", reply)
+        self.assertEqual(self.bot.style.active_name, "default")
+        reply, _ = self.send("切换人设 tsundere_whale_girl")
+        self.assertIn("已切换人设", reply)
+        self.assertEqual(self.bot.style.active_name, "tsundere_whale_girl")
+
         self.client.post("/api/personas", json={"name": "risky", "display_name": "危险",
                                                 "system_prompt": "里面写着 badword"})
         self.client.post("/api/personas/banned-words", json={"words": "badword"})
@@ -328,6 +343,8 @@ class AdminModeEndToEndTests(unittest.TestCase):
         self.send("进入管理员模式")
         self.assertTrue(self.plugin.wants(self.message("hunter2!"), self.bot), "等密码时任何消息都要被吃掉")
         self.assertTrue(self.plugin.wants(self.message("状态"), self.bot))
+        self.assertTrue(self.plugin.wants(self.message("切换人格"), self.bot))
+        self.assertTrue(self.plugin.wants(self.message("切换成默认人格"), self.bot))
 
     def test_help_lists_admin_commands(self):
         self.set_password("hunter2!")

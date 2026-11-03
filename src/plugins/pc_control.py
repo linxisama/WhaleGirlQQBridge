@@ -48,14 +48,30 @@ SAFE_CHAT_PLUGINS = frozenset({
 })
 
 SESSION_HEADS = {'回复记录': 'replies', '回复': 'replies', '聊天记录': 'replies',
-                 '人设': 'persona', '插件': 'plugin', '市场': 'market', '速度': 'speed'}
+                 '人设': 'persona', '人格': 'persona', '角色': 'persona',
+                 '插件': 'plugin', '市场': 'market', '速度': 'speed'}
+
+PERSONA_ALIASES = re.compile(
+    r'^(?:(?:切换|更换|换一个|换个|换成|换|设置|修改|改成|改为)\s*)?'
+    r'(?:人设|人格|角色)\s*(?:[:：]\s*)?(.*)$')
+
+PERSONA_TARGET_ALIASES = re.compile(
+    r'^(?:切换|更换|换|设置|修改|改成|改为)(?:成|为|到)\s*(.+)$')
+
+
+def _normalize_admin_text(text):
+    raw = str(text or '').strip().replace('\u3000', ' ')
+    raw = re.sub(r'^[\\/]+', '', raw).strip()
+    return re.sub(r'\s+', ' ', raw)
 
 
 def session_command(text):
-    """会话内命令解析；返回 ``(action, arg)``，不是命令就返回 None。"""
-    raw = re.sub(r'^[\\/]', '', str(text or '').strip())
+    """会话内命令解析；返回 (action, arg)，不是命令就返回 None。"""
+    raw = _normalize_admin_text(text)
     if not raw:
         return None
+    # 允许“人设：名字”“插件：关 x”“状态：”这类带中文冒号的写法。
+    raw = re.sub(r'^([^\s:：]{1,12})\s*[:：]\s*', r'\1 ', raw, count=1).strip()
     head, _, rest = raw.partition(' ')
     head, rest = head.strip(), rest.strip()
     if head in {'帮助', '管理', '管理帮助', 'help', '?', '？'}:
@@ -64,8 +80,14 @@ def session_command(text):
         return SESSION_WORDS[head], ''
     if head in SESSION_HEADS:
         return SESSION_HEADS[head], rest
+    # “切换成默认人格”“换成傲娇鲸鱼娘人设”：目标写在“人设/人格/角色”前面。
+    target = PERSONA_TARGET_ALIASES.match(raw)
+    if target:
+        return 'persona', target.group(1).strip(' :：')
+    alias = PERSONA_ALIASES.match(raw)
+    if alias:
+        return 'persona', alias.group(1).strip(' :：')
     return None
-
 
 class PcControl(PluginBase):
     META = PluginMeta(id='pc_control', name='机器人控制台管理', category='utility', enabled_by_default=False,
@@ -242,12 +264,21 @@ class PcControl(PluginBase):
 
     @staticmethod
     def _persona(runtime, arg):
-        name = str(arg or '').strip()
+        name = re.sub(r'^[\\/]+', '', str(arg or '').strip()).strip()
+        name = re.sub(r'\s*(?:的)?\s*(?:人设|人格|角色)\s*$', '', name).strip()
         if not name:
             styles = runtime.style.list_styles()
             return ('当前人设：' + runtime.style.active_name + '\n可用人设：'
                     + ('、'.join(v['name'] for v in styles) or '默认人设')
                     + '\n切换：人设 <标识>')
+        if name in {'默认', '默认人设', '默认人格', '默认角色', '默认风格', '内置', '内置人设'}:
+            name = 'default'
+        styles = runtime.style.list_styles()
+        if name not in {str(v.get('name')) for v in styles}:
+            for style in styles:
+                if str(style.get('display_name') or '') == name:
+                    name = str(style.get('name') or name)
+                    break
         ok, message = runtime.set_persona(name)
         return message
 
