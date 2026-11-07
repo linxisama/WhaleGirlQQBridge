@@ -6,7 +6,8 @@ Inno Setup 安装包（静默参数），由独立 cmd 进程在控制台退出�
 
 令牌只从环境变量读取（GITHUB_TOKEN / GH_TOKEN），代码里不硬编码任何令牌；
 发布方提供的 sha256 优先使用 GitHub asset 的 digest 字段，其次使用同名
-.sha256 资产；两者都没有时只回报"未校验"，不假装校验过。
+.sha256 资产；两者都没有时 check_update 会给出 needs_confirmation 和人类可读
+理由，download_update 必须拿到显式确认才继续——不假装校验过，也不默认放行。
 """
 from __future__ import annotations
 
@@ -42,6 +43,13 @@ CHECKSUM_SUFFIXES = (".sha256", ".sha256sum")
 VERIFY_DIGEST = "github-digest"
 VERIFY_CHECKSUM_ASSET = "sha256-asset"
 VERIFY_UNKNOWN = "unknown"
+# 没有任何发布方哈希时的统一说法：既是 check_update 的 confirmation_reason，也是下载拒绝的理由。
+UNVERIFIED_REASON = ("这个 Release 没有发布 sha256（安装包 digest 和 .sha256 校验资产都没有），"
+                     "安装包无法校验完整性；请到 Releases 页面手动下载并核对，"
+                     "确认无误后再选择继续未校验安装")
+# 预发布后缀的权重：数字越大越旧，于是 alpha < beta < rc < 同号正式版。
+PRE_RELEASE_RANKS = (("alpha", 3), ("beta", 2), ("rc", 1), ("pre", 1))
+VERSION_HEAD_RE = re.compile(r"[^\-+~]*")
 ASSET_HOSTS = (
     "github.com",
     "api.github.com",
@@ -88,13 +96,45 @@ def normalize_repo(value) -> str:
     return text
 
 
+def _pre_release_rank(text: str) -> int:
+    lowered = str(text or "").strip().lower()
+    for word, rank in PRE_RELEASE_RANKS:
+        if lowered.startswith(word):
+            return rank
+    return 2
+
+
 def version_key(value) -> tuple:
+    """版本号 -> 纯数字元组（最多四段），只取正式号那一段。
+
+    元组形状被既有测试钉住（tests/test_app_updater.py:29 要求
+    "v5.2.83-beta" -> (5, 2, 83)），所以预发布后缀不在这里体现，交给
+    _version_sort_key 排序。只从正式号取数是为了不让 -rc1 里的 1 冒充第 4 段。
+    """
     text = str(value or "").strip().lstrip("vV")
-    return tuple(int(part) for part in VERSION_PART_RE.findall(text)[:4])
+    head = VERSION_HEAD_RE.match(text).group(0)
+    parts = tuple(int(part) for part in VERSION_PART_RE.findall(head)[:4])
+    if not parts:
+        # 版本号不在开头（tag 带前缀）时退回宽松取数，别把老仓库直接判成"没有更新"。
+        return tuple(int(part) for part in VERSION_PART_RE.findall(text)[:4])
+    return parts
+
+
+def _version_sort_key(value) -> tuple:
+    """排序用的版本键：正式版补 0，预发布补负数，于是 alpha < beta < rc < 同号正式版。
+
+    必须补位：Python 里短元组更小，(5,2,112) 会排到 (5,2,112,-3) 前面。
+    """
+    parts = version_key(value)
+    if not parts:
+        return ()
+    text = str(value or "").strip().lstrip("vV")
+    tail = text[len(VERSION_HEAD_RE.match(text).group(0)):].lstrip("-+~ ._").strip()
+    return parts + (0 if not tail else -_pre_release_rank(tail),)
 
 
 def is_newer(latest, current) -> bool:
-    left, right = version_key(latest), version_key(current)
+    left, right = _version_sort_key(latest), _version_sort_key(current)
     if not left:
         return False
     if not right:
@@ -171,6 +211,91 @@ def pick_asset(release: dict) -> dict | None:
     return candidates[0]
 
 
+def _verify_method(info) -> str:
+    """不发网络请求判断校验方式：digest 优先，其次同名 .sha256 资产，都没有就是 unknown。
+
+    只判断"用哪种方式"，不判断"是否通过"——通过与否要等下载时算出来。
+    """
+    asset = info.get("asset") if isinstance(info, dict) else None
+    if not isinstance(asset, dict):
+        return VERIFY_UNKNOWN
+    if str(asset.get("digest") or "").strip():
+        return VERIFY_DIGEST
+    if find_checksum_asset(info, str(asset.get("name") or "")):
+        return VERIFY_CHECKSUM_ASSET
+    return VERIFY_UNKNOWN
+
+
+def update_facts(info, download=None) -> dict:
+    """把检查/下载结果收敛成写更新日志用的五要素；拿不到的项留空，写日志时显示"未知"。"""
+    info = info if isinstance(info, dict) else {}
+    asset = info.get("asset") if isinstance(info.get("asset"), dict) else {}
+    download = download if isinstance(download, dict) else {}
+    verified = bool(download.get("verified"))
+    return {
+        "repo": str(info.get("repo") or download.get("repo") or ""),
+        "current": str(info.get("current") or ""),
+        "latest": str(info.get("latest") or info.get("tag") or download.get("latest") or ""),
+        "asset": str(asset.get("name") or download.get("name") or ""),
+        "assetBytes": _safe_int(asset.get("size") or download.get("bytes")),
+        "verifyMethod": str(download.get("verifyStatus")
+                            or info.get("verify_method") or VERIFY_UNKNOWN),
+        "verifyResult": ("校验通过" if verified else "未校验" if download else "未下载"),
+        "sha256": str(download.get("sha256") or ""),
+        "path": str(download.get("path") or ""),
+    }
+
+
+# 安装包路径 -> 五要素。按路径存，上一轮下载的记录不会冒充这一轮。
+_last_update: dict = {}
+_last_update_lock = threading.Lock()
+
+
+def remember_update(info, download=None) -> dict:
+    """记住某次下载的五要素，build_update_script 写日志时按安装包路径取用。"""
+    facts = update_facts(info, download)
+    key = facts.get("path")
+    if key:
+        with _last_update_lock:
+            _last_update[key] = facts
+            while len(_last_update) > 8:
+                _last_update.pop(next(iter(_last_update)))
+    return facts
+
+
+def _log_facts(setup_path, info=None) -> dict:
+    """优先用调用方显式给的 info；否则用这个安装包上次下载时记下的五要素。"""
+    if isinstance(info, dict) and info:
+        return update_facts(info)
+    with _last_update_lock:
+        return dict(_last_update.get(str(setup_path)) or {})
+
+
+def _write_update_log(log_path, facts) -> None:
+    """先把"查了什么、选了什么、怎么校验"写进日志；安装结果之后由 cmd 追加。"""
+    facts = facts if isinstance(facts, dict) else {}
+
+    def show(key, suffix=""):
+        value = facts.get(key)
+        return ("未知" if value in (None, "") else str(value)) + suffix
+
+    size = _safe_int(facts.get("assetBytes"))
+    lines = [
+        "[update] 检查仓库=" + show("repo"),
+        "[update] 当前版本=" + show("current"),
+        "[update] 发现新版本=" + show("latest"),
+        "[update] 选中资产=" + show("asset", "（%d 字节）" % size if size else ""),
+        "[update] 校验方式=%s 结果=%s" % (show("verifyMethod"), show("verifyResult")),
+    ]
+    if facts.get("sha256"):
+        lines.append("[update] 安装包 sha256=" + str(facts["sha256"]))
+    # 固定 UTF-8：cmd 之后追加的都是 ASCII，追加进 UTF-8 文件不会坏；
+    # 用 mbcs 反而会在非中文 Windows 上写不出去。
+    # newline 显式给 CRLF：文本模式默认会把 LF 再转一次，写成 CRCRLF。
+    with log_path.open("w", encoding="utf-8", newline="\r\n") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
 def _release_info(data: dict, repo: str, current: str) -> dict:
     """把 GitHub Release 的 JSON 归一化成控制台用的检查结果。"""
     tag = str(data.get("tag_name") or data.get("name") or "").strip()
@@ -178,7 +303,17 @@ def _release_info(data: dict, repo: str, current: str) -> dict:
     truncated = len(notes) > MAX_NOTES_CHARS
     if truncated:
         notes = notes[:MAX_NOTES_CHARS]
+    assets = _release_assets(data)
     asset = pick_asset(data)
+    asset_info = None if asset is None else {
+        "name": str(asset.get("name") or ""),
+        "size": _safe_int(asset.get("size")),
+        "url": _safe_asset_url(asset.get("browser_download_url") or asset.get("url")),
+        "digest": str(asset.get("digest") or ""),
+    }
+    method = _verify_method({"asset": asset_info, "assets": assets})
+    # 没有发布方哈希就必须由用户点头：这个字段一路传到控制台和下载门闩。
+    needs_confirm = bool(asset_info) and method == VERIFY_UNKNOWN
     html_url = (str(data.get("html_url") or "").strip()
                 or "https://github.com/%s/releases/tag/%s" % (repo, quote(tag, safe="")))
     return {
@@ -196,13 +331,11 @@ def _release_info(data: dict, repo: str, current: str) -> dict:
         "notes": notes,
         "notesTruncated": truncated,
         "source": "api",
-        "assets": _release_assets(data),
-        "asset": None if asset is None else {
-            "name": str(asset.get("name") or ""),
-            "size": _safe_int(asset.get("size")),
-            "url": _safe_asset_url(asset.get("browser_download_url") or asset.get("url")),
-            "digest": str(asset.get("digest") or ""),
-        },
+        "assets": assets,
+        "asset": asset_info,
+        "verify_method": method,
+        "needs_confirmation": needs_confirm,
+        "confirmation_reason": UNVERIFIED_REASON if needs_confirm else "",
     }
 
 
@@ -264,24 +397,44 @@ def check_update(repo, current: str, timeout: float = 20.0) -> dict:
     token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
     if token:
         headers["Authorization"] = "Bearer " + token
-    with httpx.Client(timeout=timeout, follow_redirects=True,
-                      headers=headers) as client:
-        response = client.get(url)
-        if response.status_code == 404:
-            raise ValueError("GitHub 仓库或 Release 不存在：" + repo)
-        if response.status_code in (403, 429):
+    try:
+        with httpx.Client(timeout=timeout, follow_redirects=True,
+                          headers=headers) as client:
+            response = client.get(url)
+            if response.status_code == 404:
+                raise ValueError("GitHub 仓库或 Release 不存在：" + repo
+                                 + "；请检查设置里的更新仓库，或到 Releases 页面确认已发版")
+            if response.status_code in (403, 429):
+                try:
+                    return _html_release(client, repo, current)
+                except Exception as fallback_error:
+                    raise ValueError(
+                        "GitHub 接口访问受限（HTTP %d，通常是未登录限流：每小时 60 次）。"
+                        "也可以设置 GITHUB_TOKEN 后重启再试；备用 Release 页面也没读到更新信息：%s"
+                        % (response.status_code, fallback_error)
+                    ) from fallback_error
+            response.raise_for_status()
+            if _safe_int(response.headers.get("content-length")) > MAX_RELEASES_BYTES:
+                raise ValueError("GitHub Release 信息异常大（超过 2 MB），已拒绝；"
+                                 "请到 Releases 页面查看更新说明")
             try:
-                return _html_release(client, repo, current)
-            except Exception as fallback_error:
-                raise ValueError(
-                    "GitHub 接口访问受限（HTTP %d，通常是未登录限流：每小时 60 次）。"
-                    "也可以设置 GITHUB_TOKEN 后重启再试；备用 Release 页面也没读到更新信息：%s"
-                    % (response.status_code, fallback_error)
-                ) from fallback_error
-        response.raise_for_status()
-        if _safe_int(response.headers.get("content-length")) > MAX_RELEASES_BYTES:
-            raise ValueError("GitHub Release 信息异常大，已拒绝")
-        data = response.json()
+                data = response.json()
+            except ValueError as exc:
+                # 响应不是合法 JSON（限流页、代理拦截页）时，别把解析错误原样丢给用户。
+                raise ValueError("GitHub 返回的 Release 信息不是合法 JSON（可能被代理或限流页拦截）："
+                                 "请检查网络后重试，或到 Releases 页面手动查看") from exc
+    except httpx.TimeoutException as exc:
+        raise ValueError("连接 GitHub 超时（%.0f 秒）：请检查网络或代理后重试；"
+                         "也可以到 Releases 页面手动下载" % float(timeout)) from exc
+    except httpx.HTTPError as exc:
+        raise ValueError("连接 GitHub 失败：%s。请检查网络或代理后重试，"
+                         "也可以到 Releases 页面手动下载" % (exc or exc.__class__.__name__)) from exc
+    except ValueError:
+        raise
+    except Exception as exc:
+        # 响应不是合法 JSON 时 httpx 会抛 json 解析错误；这里不能让它裸奔成 500。
+        raise ValueError("GitHub 返回的 Release 信息读不出来（%s）：请稍后重试，"
+                         "或到 Releases 页面手动查看" % (exc or exc.__class__.__name__)) from exc
     if not isinstance(data, dict):
         raise ValueError("GitHub 返回的 Release 信息格式不正确")
     return _release_info(data, repo, current)
@@ -480,11 +633,17 @@ def _safe_filename(value: str, fallback: str = "update.exe") -> str:
     return name or fallback
 
 
-def download_update(info: dict, dest_dir=None, timeout: float = 600.0, progress=None) -> dict:
+def download_update(info: dict, dest_dir=None, timeout: float = 600.0, progress=None,
+                    allow_unverified: bool = False) -> dict:
     """下载 Release 里的安装包；边下边算 sha256，不把整个文件读进内存。
 
     progress 可选，形如 progress(done_bytes, total_bytes)；可以直接传
     UpdateProgress 实例，边下边用 snapshot() 轮询。
+
+    allow_unverified 是"未校验也继续"的唯一开关。当 info 来自 check_update 且
+    该 Release 没有任何发布方哈希（needs_confirmation=True）时，拿不到哈希就
+    直接抛 ValueError，调用方必须拿到用户确认再显式传 True——不默认放行。
+    手工拼出来的 info（老调用方、传输层测试）不带这个字段，行为保持不变。
     """
     asset = info.get("asset") if isinstance(info, dict) else None
     if not isinstance(asset, dict):
@@ -495,6 +654,8 @@ def download_update(info: dict, dest_dir=None, timeout: float = 600.0, progress=
     raw_name = str(asset.get("name") or "")
     if raw_name and not raw_name.lower().endswith(".exe"):
         raise ValueError("安装包文件名不是 .exe，已拒绝：" + raw_name[:120])
+    # 只有 check_update 产出的 info 才带这个字段；它说明"发布方没有哈希，要用户点头"。
+    needs_confirm = info.get("needs_confirmation") is True
     name = _safe_filename(raw_name, "WhaleGirlQQBridge-Setup.exe")
     root = Path(dest_dir) if dest_dir else update_script_dir()
     root.mkdir(parents=True, exist_ok=True)
@@ -513,6 +674,9 @@ def download_update(info: dict, dest_dir=None, timeout: float = 600.0, progress=
                           headers={"User-Agent": USER_AGENT}) as client:
             expected_sha, verify_status = _published_sha256(client, info, raw_name,
                                                             asset.get("digest"))
+            if not expected_sha and not allow_unverified and needs_confirm:
+                # 不默认放行：check_update 已经说明这个版本没有哈希，停在下载前。
+                raise ValueError(UNVERIFIED_REASON)
             with client.stream("GET", url) as response:
                 response.raise_for_status()
                 host = (urlsplit(str(response.url)).hostname or "").lower()
@@ -551,6 +715,15 @@ def download_update(info: dict, dest_dir=None, timeout: float = 600.0, progress=
     except Exception as exc:
         part.unlink(missing_ok=True)
         _progress_state(progress, "error", str(exc) or exc.__class__.__name__)
+        if isinstance(exc, ValueError):
+            raise
+        if isinstance(exc, httpx.TimeoutException):
+            raise ValueError("下载安装包超时（%.0f 秒）：请检查网络或代理后重试，"
+                             "也可以到 Releases 页面手动下载" % float(timeout)) from exc
+        if isinstance(exc, httpx.HTTPError):
+            raise ValueError("下载安装包失败：%s。请检查网络或代理后重试，"
+                             "也可以到 Releases 页面手动下载"
+                             % (exc or exc.__class__.__name__)) from exc
         raise
     result = {
         "path": str(target),
@@ -562,6 +735,7 @@ def download_update(info: dict, dest_dir=None, timeout: float = 600.0, progress=
         "verifyStatus": verify_status if verified else VERIFY_UNKNOWN,
         "expectedSha256": expected_sha,
     }
+    remember_update(info, result)
     _progress_state(progress, "done", "安装包已就绪")
     _progress_finish(progress, result["path"], result["sha256"],
                      result["verified"], result["verifyStatus"])
@@ -588,8 +762,12 @@ def _batch_quote(value: str) -> str:
     return text.replace("%", "%%")
 
 
-def build_update_script(setup_path, app_exe, pid: int, install_dir=None) -> Path:
-    """生成一个等待控制台退出、记录日志、静默安装、再拉起的 cmd 脚本。"""
+def build_update_script(setup_path, app_exe, pid: int, install_dir=None, info=None) -> Path:
+    """生成一个等待控制台退出、记录日志、静默安装、再拉起的 cmd 脚本。
+
+    info 可选：显式给出检查结果，日志里就能写清检查了哪个仓库、当前/新版本、
+    选中哪个资产；不给时用最近一次 download_update 记下的五要素。
+    """
     setup = Path(setup_path)
     if not setup.is_file():
         raise ValueError("安装包文件不存在：" + str(setup))
@@ -601,6 +779,11 @@ def build_update_script(setup_path, app_exe, pid: int, install_dir=None) -> Path
     directory.mkdir(parents=True, exist_ok=True)
     script = directory / ("apply-%d.cmd" % _safe_int(pid))
     log_file = update_log_path(pid)
+    # 检查要素先落盘，安装结果之后由 cmd 追加到同一个文件。
+    try:
+        _write_update_log(log_file, _log_facts(setup, info))
+    except OSError as exc:
+        log.warning("写更新日志失败（继续安装）：%s", exc)
     # 只记录当前 exe 和安装目录，不复制整个目录。
     lines = [
         "@echo off",
@@ -642,6 +825,10 @@ def build_update_script(setup_path, app_exe, pid: int, install_dir=None) -> Path
         'if "%RC%"=="0" goto installed',
         '>>"%LOG%" echo [ERROR] installer failed exitcode=%RC% (0=ok 3010=reboot required)',
         '>>"%LOG%" echo [ERROR] setup="%SETUP%" dir="%DIR%"',
+        # 日志要能让用户自己往下走：装不上就指到 Releases 页面手动装。
+        # 这里必须是纯 ASCII：cmd 按控制台代码页写字节，中文会在部分系统上变乱码。
+        '>>"%LOG%" echo [ERROR] install not finished: download Setup.exe from the Releases'
+        ' page and run it; if it still fails, close every WhaleGirlQQBridge process first',
         "goto relaunch",
         ":installed",
         '>>"%LOG%" echo [update] installer finished exitcode=0',

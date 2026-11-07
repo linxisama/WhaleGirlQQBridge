@@ -128,18 +128,27 @@ class ClassifyTierTests(ManifestTestCase):
         self.assertIn("api.example.com", info["tierReason"])
 
     def test_t3_extra_api_permission(self):
+        # onebot / qq_sticker 曾被当成「宿主没开放的额外 API」降级到 T3，实测宿主本来就给：
+        # ctx.onebot 见 runtime/qqagent-host/src/orchestrator.js:958，ctx.stickers 见 :961，
+        # 工具执行期 ctx 字段清单见 runtime/qqagent-host/src/tools.js:128-136。
+        # 所以这两个权限现在按 clean 归 T1；EXTRA_APIS 只剩常量，不再参与分层。
         for permission in ("onebot", "qq_sticker"):
             with self.subTest(permission=permission):
                 info = classify_path(
                     self.package(permission, package_files(permission, permissions=[permission]))
                 )
-                self.assertEqual(info["tier"], "T3-extra-api")
-                self.assertIn(permission, info["tierReason"])
+                self.assertEqual(info["tier"], "T1-ready")
+                self.assertEqual(info["tierReason"], "clean")
+                self.assertEqual(info["permissions"], [permission])
 
-    def test_t4_host_source_import(self):
+    def test_two_level_import_keeps_clean_tier(self):
+        # 2 层上溯在宿主里能解析：包运行期在 <source>/skills-host-<pid>/0000-<id>/
+        # （runtime/qqagent-host/host-one.mjs:204），上溯 2 层正好回到 <source>/。
+        # 所以它只记 hostImports，不降层级（T4 分支故意不可达，见 classify 里的长注释）。
         entry = "import {cfg} from '../../src/config.js';\n" + ENTRY_OK
         info = classify_path(self.package("hosty", package_files("hosty", entry=entry)))
-        self.assertEqual(info["tier"], "T4-host-source")
+        self.assertEqual(info["tier"], "T1-ready")
+        self.assertEqual(info["tierReason"], "clean")
         self.assertEqual(info["hostImports"], ["../../src/config.js"])
 
     def test_t5_depends_other_requires(self):
@@ -198,24 +207,26 @@ class ClassifyTierTests(ManifestTestCase):
         self.assertEqual(info["requires"], ["currency.v1"])
         self.assertEqual(info["tier"], "T5-depends-other")
 
-    def test_host_import_beats_requires(self):
+    def test_requires_outranks_host_import(self):
+        # T4 分支故意不可达，两者同时命中时由 requires 决定层级，hostImports 只记账。
         files = package_files(
             "both",
             entry="import {x} from '../../src/store.js';\n" + ENTRY_OK,
             requires=["rapport.v1"],
         )
         info = classify_path(self.package("both", files))
-        self.assertEqual(info["tier"], "T4-host-source")
+        self.assertEqual(info["tier"], "T5-depends-other")
+        self.assertEqual(info["hostImports"], ["../../src/store.js"])
 
     def test_escape_from_non_entry_file_is_not_fatal(self):
-        # 只有入口自己逃出运行目录才是加载失败；子文件往上 import 仍算依赖宿主源码。
+        # 只有入口自己逃出运行目录才是加载失败；子文件往上 import 不致命，只记 hostImports。
         files = {
             "skill.json": declaration("sub"),
             "index.js": "import './lib/remote.js';\n" + ENTRY_OK,
             "lib/remote.js": "import deep from '../../../../outside/deep.js';\n",
         }
         info = classify_path(self.package("sub", files))
-        self.assertEqual(info["tier"], "T4-host-source")
+        self.assertEqual(info["tier"], "T1-ready")
         self.assertIn("../../../../outside/deep.js", info["hostImports"])
 
     def test_register_tool_inside_comment_is_ignored(self):
@@ -268,7 +279,7 @@ class ClassifyExtractionTests(ManifestTestCase):
         entry = "// import ghost from '../../src/ghost.js';\n" + ENTRY_OK
         info = classify_path(self.package("ghost", package_files("ghost", entry=entry)))
         self.assertEqual(info["hostImports"], ["../../src/ghost.js"])
-        self.assertEqual(info["tier"], "T4-host-source")
+        self.assertEqual(info["tier"], "T1-ready")
 
     def test_classify_bad_zip_returns_t6(self):
         broken = self.tmp / "broken.zip"

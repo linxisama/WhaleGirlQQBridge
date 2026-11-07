@@ -28,6 +28,20 @@ from . import PluginBase, PluginMeta, FieldSchema
 
 _TZ_CST = timezone(timedelta(hours=8))
 DEFAULT_GUIDE = "自然口语、贴合人设、像随手开个话头；不要提「暖场」两个字，不要群发感。"
+
+
+def _persona_for(runtime, kind, target):
+    """按这个会话的绑定取人设，拿不到才回落全局人设。
+
+    暖场消息是发进具体某个群/私聊的，直接取全局人设会把别处的人设带进来。
+    异常一律吞掉：选人设失败不该让暖场停摆。
+    """
+    try:
+        from ..persona_bindings import resolve_persona
+        persona = resolve_persona(runtime, {"kind": str(kind), "target": str(target), "text": ""})
+        return persona.full_prompt()
+    except Exception:
+        return runtime.style.full_prompt() if hasattr(runtime, "style") else ""
 STATE_FILE = "icebreaker.json"
 # group_1059300934 / private_1410897629
 _CHAT_KEY = re.compile(r'^(group|private)_(\d+)$')
@@ -323,7 +337,7 @@ class Icebreaker(PluginBase):
             async def generate():
                 return await ai.chat(
                     [{"role":"user","content":build_prompt(self.get("guide", ""),max_length)}],
-                    system_prompt=runtime.style.full_prompt() if hasattr(runtime,'style') else '',
+                    system_prompt=_persona_for(runtime, kind, target),
                     temperature=float(self.get("temperature",0.9) or 0.9),max_tokens=max(32,max_length*2))
             if hasattr(runtime,'ai_lock'):
                 async with runtime.ai_lock:raw=await generate()

@@ -25,12 +25,12 @@ from urllib.parse import quote, urlencode
 
 try:
     from PyQt6.QtCore import Qt, QTimer
-    from PyQt6.QtGui import QBrush, QColor, QFont
+    from PyQt6.QtGui import QBrush, QColor, QFont, QTextCursor
     from PyQt6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                  QFileDialog, QHBoxLayout, QHeaderView, QLabel,
                                  QLineEdit, QPlainTextEdit, QPushButton,
-                                 QTableWidget, QTableWidgetItem, QVBoxLayout,
-                                 QWidget, QApplication)
+                                 QTableWidget, QTableWidgetItem, QTextEdit,
+                                 QVBoxLayout, QWidget, QApplication)
     _HAS_QT = True
 except Exception:       # pragma: no cover - 没有 PyQt 的纯逻辑环境
     _HAS_QT = False
@@ -46,10 +46,36 @@ ALL_SOURCES_TEXT = '全部'
 LEVEL_CHOICES = (('全部', ''), ('错误', 'error'), ('警告', 'warning'),
                  ('信息', 'info'), ('调试', 'debug'))
 LEVEL_TEXT = {'error': '错误', 'warning': '警告', 'info': '信息', 'debug': '调试'}
+# 主题：卡片/正文/弱化/边框/强调复用 src/gui/menu_style.DEFAULT_THEME（同一套浅色底），
+# 日志页独有的语义色（级别、搜索命中）集中定义在这里，方法里不再出现颜色字面量。
+try:
+    from .menu_style import DEFAULT_THEME as _BASE_THEME
+except Exception:      # pragma: no cover - 脱离包运行时兜底
+    _BASE_THEME = {'card': '#FFFFFF', 'text': '#1F2733', 'muted': '#5F6B7A',
+                   'border': '#D3DAE3', 'accent': '#2FA8A0',
+                   'accent_light': '#E2F5F2'}
+
+THEME = {
+    'card': _BASE_THEME['card'],
+    'text': _BASE_THEME['text'],
+    'muted': _BASE_THEME['muted'],
+    'border': _BASE_THEME['border'],
+    'accent': _BASE_THEME['accent'],
+    'accent_light': _BASE_THEME['accent_light'],
+    'error': '#b42318',
+    'warning': '#b54708',
+    'info': '#3a5a80',
+    'debug': '#6b7280',
+    'fallback': '#57606a',
+    'match': '#FFF0B3',
+}
 # 级别列前景色：错误=红，警告=橙，信息=蓝灰，调试=灰。
-LEVEL_COLORS = {'error': '#b42318', 'warning': '#b54708',
-                'info': '#3a5a80', 'debug': '#6b7280'}
-FALLBACK_COLOR = '#57606a'
+LEVEL_COLORS = {'error': THEME['error'], 'warning': THEME['warning'],
+                'info': THEME['info'], 'debug': THEME['debug']}
+FALLBACK_COLOR = THEME['fallback']
+MATCH_COLOR = THEME['match']
+STATUS_ERROR_STYLE = 'color:%s;' % THEME['error']
+FOLLOW_LATEST_TEXT = '跟随最新'
 NOT_READY_TEXT = '日志接口还没就绪，请重启控制台后再试'
 FAIL_TEXT = '日志接口请求失败：%s'
 EMPTY_DETAIL_TEXT = '（这条没有附加详情）'
@@ -125,6 +151,35 @@ def entry_line(entry: Any) -> str:
                             _text(item.get('source')).strip(), _one_line(item.get('message')))
     detail = _one_line(item.get('detail'))
     return '%s | %s' % (head.strip(), detail) if detail else head.strip()
+
+
+def match_spans(text: Any, query: Any) -> List[tuple]:
+    """关键词命中的字符区间：大小写不敏感，返回 [(start, end), ...]。"""
+    haystack = _text(text)
+    needle = _text(query).strip()
+    if not haystack or not needle:
+        return []
+    folded, target = haystack.casefold(), needle.casefold()
+    spans: List[tuple] = []
+    start = folded.find(target)
+    while start >= 0:
+        spans.append((start, start + len(needle)))
+        start = folded.find(target, start + len(needle))
+    return spans
+
+
+def entry_matches(entry: Any, query: Any) -> bool:
+    """一条日志是否命中关键词：时间/级别/来源/摘要/详情任一命中即算。"""
+    if not _text(query).strip():
+        return True
+    item = entry if isinstance(entry, dict) else {}
+    fields = (display_time(item.get('ts')), level_text(item.get('level')),
+              item.get('source'), item.get('message'), item.get('detail'))
+    return any(match_spans(field, query) for field in fields)
+
+
+def matched_row_count(entries: Any, query: Any) -> int:
+    return sum(1 for item in (entries or []) if entry_matches(item, query))
 
 
 class LogsError(Exception):
@@ -218,6 +273,9 @@ if _HAS_QT:
             self._queue: List[Dict[str, Any]] = []
             self._closed = False
             self._first_show = False
+            self.follow_latest = True
+            self._pending_scroll: Optional[int] = None
+            self._page_state: Dict[str, Any] = {}
             self.auto_interval_ms = AUTO_REFRESH_MS
             self.build()
             from .panel_requests import PanelRequests
@@ -270,6 +328,12 @@ if _HAS_QT:
             self.input_query.returnPressed.connect(self.refresh)
             toolbar.addWidget(self.input_query, 1)
 
+            self.btn_copy_row = QPushButton('复制选中行')
+            self.btn_copy_row.setObjectName('logs_copy_row')
+            self.btn_copy_row.setToolTip('把表格里选中的那一条按「时间 级别 来源 摘要」复制成一行')
+            self.btn_copy_row.clicked.connect(self.action_copy_row)
+            toolbar.addWidget(self.btn_copy_row)
+
             self.btn_refresh = QPushButton('刷新')
             self.btn_refresh.setObjectName('logs_refresh')
             self.btn_refresh.setToolTip('重新拉取列表（任何状态都能点）')
@@ -281,6 +345,13 @@ if _HAS_QT:
             self.check_auto.setToolTip('页面可见时每 5 秒重拉一次；切走就暂停')
             self.check_auto.toggled.connect(self._on_auto_toggled)
             toolbar.addWidget(self.check_auto)
+
+            self.check_follow = QCheckBox(FOLLOW_LATEST_TEXT)
+            self.check_follow.setObjectName('logs_follow')
+            self.check_follow.setToolTip('新日志到达时滚到最新一条；关掉后停在当前位置，方便翻旧记录')
+            self.check_follow.setChecked(self.follow_latest)
+            self.check_follow.toggled.connect(self._on_follow_toggled)
+            toolbar.addWidget(self.check_follow)
             layout.addLayout(toolbar)
 
             self.table = QTableWidget(0, len(COLUMNS))
@@ -333,6 +404,22 @@ if _HAS_QT:
             self.status_label.setObjectName('logs_status')
             self.status_label.setWordWrap(True)
             layout.addWidget(self.status_label)
+            self._apply_style()
+
+        def _apply_style(self) -> None:
+            """颜色只从 THEME 取：表格/详情/状态行与外壳同一套浅色底。"""
+            self.setStyleSheet(f"""
+                QLabel#logs_title {{ color:{THEME['text']}; font-size:18px; font-weight:600; }}
+                QLabel#logs_hint {{ color:{THEME['muted']}; font-size:11px; }}
+                QLabel#logs_status {{ color:{THEME['muted']}; font-size:11px; }}
+                QTableWidget#logs_table {{ background:{THEME['card']}; color:{THEME['text']};
+                    border:1px solid {THEME['border']}; border-radius:8px;
+                    gridline-color:{THEME['border']}; }}
+                QTableWidget#logs_table::item:selected {{ background:{THEME['accent_light']};
+                    color:{THEME['text']}; }}
+                QPlainTextEdit#logs_detail {{ background:{THEME['card']}; color:{THEME['text']};
+                    border:1px solid {THEME['border']}; border-radius:8px; padding:6px; }}
+            """)
 
         # ── 筛选 / 请求 ─────────────────────────────────────────────────────
         def current_filters(self) -> Dict[str, str]:
@@ -374,7 +461,7 @@ if _HAS_QT:
 
         def _set_status(self, text: str, error: bool = False) -> None:
             self.status_label.setText(text)
-            self.status_label.setStyleSheet('color:#b42318;' if error else '')
+            self.status_label.setStyleSheet(STATUS_ERROR_STYLE if error else '')
 
         # ── 渲染 ────────────────────────────────────────────────────────────
         def _apply_list(self, spec, payload) -> None:
@@ -390,6 +477,9 @@ if _HAS_QT:
 
         def _render(self) -> None:
             self._fill_sources(self.entries)
+            query = self.current_filters()['query']
+            bar = self.table.verticalScrollBar()
+            previous = bar.value()
             self.table.setRowCount(len(self.entries))
             for row, entry in enumerate(self.entries):
                 cells = (QTableWidgetItem(display_time(entry.get('ts'))),
@@ -400,6 +490,9 @@ if _HAS_QT:
                 ident = _text(entry.get('id'))
                 for column, cell in enumerate(cells):
                     cell.setData(Qt.ItemDataRole.UserRole, ident)
+                    if match_spans(cell.text(), query):
+                        cell.setBackground(QBrush(QColor(MATCH_COLOR)))
+                        cell.setToolTip('关键词命中：%s' % query)
                     self.table.setItem(row, column, cell)
             keep = -1
             if self._selected_id:
@@ -413,10 +506,23 @@ if _HAS_QT:
                 self._selected_id = ''
                 self.detail.setPlaceholderText(DETAIL_HINT)
                 self.detail.setPlainText('')
+            target = previous if self._pending_scroll is None else self._pending_scroll
+            self._pending_scroll = None
+            if self.follow_latest:
+                self._scroll_to_latest()
+            else:
+                bar.setValue(min(target, bar.maximum()))
             shown = len(self.entries)
             message = '共 %d 条（显示最近 %d 条）' % (self.total, shown)
             if self.truncated:
                 message += '，已截断'
+            hits = matched_row_count(self.entries, query)
+            if query:
+                message += '，关键词命中 %d 条' % hits
+            if not self.follow_latest:
+                message += '，已暂停跟随最新'
+            # 选中行没变时 itemSelectionChanged 不会重发，高亮要在这里按新关键词重刷。
+            self._highlight_detail()
             self._set_status(message)
 
         def _fill_sources(self, entries) -> None:
@@ -448,6 +554,35 @@ if _HAS_QT:
             self._selected_id = _text(entry.get('id'))
             self.detail.setPlaceholderText('')
             self.detail.setPlainText(entry_detail_text(entry))
+            self._highlight_detail()
+
+        def _highlight_detail(self) -> None:
+            """详情区里同样高亮关键词（大小写不敏感）；没有关键词就清空高亮。"""
+            query = self.current_filters()['query']
+            selections = []
+            text = self.detail.toPlainText()
+            for start, end in match_spans(text, query):
+                selection = QTextEdit.ExtraSelection()
+                selection.format.setBackground(QBrush(QColor(MATCH_COLOR)))
+                cursor = self.detail.textCursor()
+                cursor.setPosition(start)
+                cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                selection.cursor = cursor
+                selections.append(selection)
+            self.detail.setExtraSelections(selections)
+
+        def _scroll_to_latest(self) -> None:
+            if self._closed:
+                return
+            self.table.scrollToBottom()
+            bar = self.table.verticalScrollBar()
+            bar.setValue(bar.maximum())
+
+        def _on_follow_toggled(self, checked) -> None:
+            self.follow_latest = bool(checked)
+            if self.follow_latest:
+                self._scroll_to_latest()
+            self._set_status('跟随最新：开' if self.follow_latest else '跟随最新：关（列表不再自动滚动）')
 
         # ── 动作 ────────────────────────────────────────────────────────────
         def action_copy_one(self) -> None:
@@ -457,6 +592,15 @@ if _HAS_QT:
                 return
             QApplication.clipboard().setText(text)
             self._set_status('已复制 1 条')
+
+        def action_copy_row(self) -> None:
+            """复制表格里选中的那一行（不用先点「复制这条」拿详情）。"""
+            row = self.table.currentRow()
+            if row < 0 or row >= len(self.entries):
+                self._set_status('先在列表里选中一行，再复制')
+                return
+            QApplication.clipboard().setText(entry_line(self.entries[row]))
+            self._set_status('已复制选中行（第 %d 行）' % (row + 1))
 
         def action_copy_all(self) -> None:
             if not self.entries:
@@ -505,6 +649,47 @@ if _HAS_QT:
             self.detail.setPlaceholderText(DETAIL_HINT)
             self._set_status('列表已清空（后端日志文件没动，点刷新会重新读回来）')
 
+        # ── 页面状态 ────────────────────────────────────────────────────────
+        def page_state(self) -> Dict[str, Any]:
+            """轻量状态字典：切页再回来靠它恢复筛选、选中行与滚动位置。"""
+            bar = self.table.verticalScrollBar()
+            return {
+                'level': _text(self.combo_level.currentData()).strip(),
+                'source': _text(self.combo_source.currentData()).strip(),
+                'query': self.input_query.text().strip(),
+                'selected_id': self._selected_id,
+                'scroll': int(bar.value()),
+                'follow': bool(self.check_follow.isChecked()),
+            }
+
+        def apply_state(self, state: Any) -> None:
+            """把 page_state() 装回控件；信号全程静音，不触发多余请求。"""
+            data = state if isinstance(state, dict) else {}
+            level, source = self.combo_level, self.combo_source
+            follow = self.check_follow
+            blocked = (level.blockSignals(True), source.blockSignals(True),
+                       follow.blockSignals(True))
+            try:
+                index = level.findData(_text(data.get('level')).strip())
+                level.setCurrentIndex(index if index >= 0 else 0)
+                name = _text(data.get('source')).strip()
+                index = source.findData(name) if name else 0
+                source.setCurrentIndex(index if index >= 0 else 0)
+                self.input_query.setText(_text(data.get('query')))
+                value = data.get('follow')
+                follow.setChecked(True if value is None else bool(value))
+                self.follow_latest = follow.isChecked()
+                self._selected_id = _text(data.get('selected_id'))
+            finally:
+                level.blockSignals(blocked[0])
+                source.blockSignals(blocked[1])
+                follow.blockSignals(blocked[2])
+            scroll = data.get('scroll')
+            self._pending_scroll = scroll if isinstance(scroll, int) else None
+            bar = self.table.verticalScrollBar()
+            if self._pending_scroll is not None:
+                bar.setValue(min(self._pending_scroll, bar.maximum()))
+
         # ── 生命周期 ────────────────────────────────────────────────────────
         def _on_auto_toggled(self, checked) -> None:
             if checked and self.isVisible():
@@ -514,6 +699,8 @@ if _HAS_QT:
 
         def showEvent(self, event):
             super().showEvent(event)
+            if self._page_state:
+                self.apply_state(self._page_state)
             if self.check_auto.isChecked():
                 self.auto_timer.start()
             if not self._first_show:
@@ -521,6 +708,7 @@ if _HAS_QT:
                 self.first_timer.start()
 
         def hideEvent(self, event):
+            self._page_state = self.page_state()
             self.auto_timer.stop()
             super().hideEvent(event)
 

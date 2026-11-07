@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from . import PluginBase, PluginMeta, FieldSchema
 from ..audio_contracts import ContractError
-from ..audio_reply_policy import decide_voice
+from ..audio_reply_policy import decide_voice, fit_segments
 
 
 class VoiceReply(PluginBase):
@@ -66,8 +66,7 @@ class VoiceReply(PluginBase):
             limit = max(1, min(int(self.get('maxChars', 120) or 120), 300))
         except (TypeError, ValueError):
             limit = 120
-        text = '，'.join(segment.strip('，。 ') for segment in decision.segments
-                        if segment.strip('，。 '))[:limit]
+        text, truncated = fit_segments(decision.segments, limit)
         if not text:
             return reply
         gateway = getattr(runtime, 'audio_gateway', None)
@@ -93,4 +92,9 @@ class VoiceReply(PluginBase):
         except Exception:
             if bool(self.get('fallbackToText', True)):
                 return reply + '\n（语音没有生成；以上文字仍然有效。）'
+            return reply
+        if truncated:
+            # 朗读被字数上限截短时必须说出来：用户听到的和看到的对不上，
+            # 又没被告知，就会以为机器人少说了一半意思。
+            return reply + '\n（语音按单段上限朗读了前 %d 字，完整内容见上。）' % len(text)
         return reply

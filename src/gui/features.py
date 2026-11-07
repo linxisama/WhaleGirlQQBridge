@@ -40,7 +40,14 @@ class FeaturesDialog(QDialog):
         try:
             self.snapshot=self.get('persona-bindings');self.table.setRowCount(0)
             for row in self.snapshot.get('rows',[]):self.add_row(row)
-            self.notice.setText('当前接入：'+str(self.snapshot.get('mode',''))+'。修改后点击“保存绑定”。刷新会丢弃尚未保存的表格修改。')
+            # 失效的绑定要在这里说出来：违禁词人设会被 resolve_persona 跳过，
+            # 表格里却还是一行正常的绑定，不提示就永远发现不了那个群在用默认人设。
+            bad=self.snapshot.get('invalid') or {}
+            note='当前接入：'+str(self.snapshot.get('mode',''))+'。修改后点击“保存绑定”。刷新会丢弃尚未保存的表格修改。'
+            if bad:
+                detail='、'.join('%s（%s）'%(name,'命中违禁词' if why=='blocked' else '人设不存在') for name,why in sorted(bad.items())[:5])
+                note='这些绑定不会生效：'+detail+'。'+note
+            self.notice.setText(note)
         except Exception as exc:self.error(exc)
     def add_row(self,value):
         index=self.table.rowCount();self.table.insertRow(index)

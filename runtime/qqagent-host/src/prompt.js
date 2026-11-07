@@ -712,18 +712,24 @@ export function buildUserPrompt(ctx) {
   // 与系统提示词共用同一来源 —— 两处不一致会让"系统里的角色"和"输入里的角色"打架。
   const chatPersona = personaForChat(ctx.chatKey);
   const now = Date.now();
-  const excludeIds = ctx.triggerEntries.map((m) => m.id);
+  // 触发批的 id 只在"同一本存档"里才有意义：
+  // 本地聊天借看别的存档时，触发条目的 id 属于 local:console，跟被借存档的 id 是两套编号，
+  // 拿它们去排除会把人家 id 相同的消息误删掉 → 借看时不做任何排除。
+  const excludeIds = ctx.contextFrom ? [] : ctx.triggerEntries.map((m) => m.id);
   // 读取条数由上下文档位决定（ctx.contextLimit 由 orchestrator 在唤醒时算好传来；
   // 随机档的骰子结果必须固定，否则每次渲染都会重新掷、提示词与会话记录对不上）
   const contextLimit = ctx.contextLimit === null || ctx.contextLimit === undefined
     ? null                                   // 没给 = 按默认（全读档的上限）
     : Math.max(0, Number(ctx.contextLimit) || 0);
-  const past = buildPastState(ctx.store, ctx.chatKey, { excludeIds, limit: contextLimit });
+  // 只读借用别的存档：本地聊天可以"读某个存档的记忆与历史"，但**写**仍然写在
+  // 自己的 chatKey 上（记忆写入走 ctx.chatKey，不经过这里）。contextFrom 只影响读。
+  const contextKey = ctx.contextFrom || ctx.chatKey;
+  const past = buildPastState(ctx.store, contextKey, { excludeIds, limit: contextLimit });
   // 锚定轮需要"截尾前的全部已读"来补齐锚点条目（2026-09-26 修：锚定轮不受
   // historyCount 截尾 —— 先按滑窗取一遍是为了 reset 轮的窗口口径，锚定成立时
   // 再从全量池里把锚点条目找回来）。全量池 = 排除触发批后的最近 500 条已读
   // （500 是 drain 路径的上界，远大于任何合理的锚点+追加规模）。
-  const pastPool = buildPastState(ctx.store, ctx.chatKey, { excludeIds, limit: 500 });
+  const pastPool = buildPastState(ctx.store, contextKey, { excludeIds, limit: 500 });
 
   // ── 提示词锚点（前缀缓存深化）──
   // 连续触发时把上一轮的【记忆】+【已读信息】前缀原样复用，新内容追加其后。
@@ -819,10 +825,14 @@ export function buildUserPrompt(ctx) {
       if (m.senderId && !m.self) relevantUserIds.add(String(m.senderId));
     }
   }
-  const memText = ctx.memory.formatForPrompt(ctx.chatKey, { userIds: [...relevantUserIds] });
+  const memText = ctx.memory.formatForPrompt(contextKey, { userIds: [...relevantUserIds] });
 
   // 记忆段（锚定模式的字节前缀从这段开始跨轮不变）
   if (memText) parts.push(`【记忆】\n${memText}`);
+  // 只读借用别人的存档：把边界说清楚，免得她往人家的记忆里写东西
+  if (ctx.contextFrom) {
+    parts.push(`【只读借用】上面这些记忆和已读消息读自存档「${ctx.contextFrom}」，只读。不要往那里写记忆（memory_append 会写在当前会话自己的记忆里），也别把那里的人当成此刻在跟你说话的人。`);
+  }
 
   // 已读信息（锚定模式 = 锚点条目；标准模式 = 全部条目）
   const readHeaderText = anchored

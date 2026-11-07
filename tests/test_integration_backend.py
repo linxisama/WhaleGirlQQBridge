@@ -76,7 +76,8 @@ class UpdateProgressRouteTests(_BackendRouteTestCase):
         started = threading.Event()
         release_gate = threading.Event()
 
-        def fake_download(info, dest_dir=None, timeout=600.0, progress=None):
+        def fake_download(info, dest_dir=None, timeout=600.0, progress=None,
+                         allow_unverified=False):
             self.assertIsNotNone(progress)
             progress(50, 100)
             started.set()

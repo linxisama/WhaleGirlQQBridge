@@ -212,27 +212,34 @@ class CtxScanTest(TempCase):
         self.assertNotIn('config', blocked)
 
     def test_gated_builtin_blocks_until_its_permission_is_declared(self):
-        # node:child_process 已从 GATED 移到 NODE_BUILTIN_ACCOUNTED（W8a），所以这里用
-        # node:net 保住「GATED 档必须自己声明权限名」的语义。
-        folder = self.tmp / 'net'
-        folder.mkdir()
-        (folder / 'index.js').write_text(
-            "require('node:net').connect(80, 'example.com');", encoding='utf-8')
-        usage = skill_tools.ctx_api_usage(str(folder))
-        self.assertIn('node:net', usage)
-        self.assertEqual(skill_tools.blocked_capabilities(usage), {'node:net'})
-        # 闸没死：声明了 GATED 映射里的权限名就放行。
-        self.assertEqual(skill_tools.blocked_capabilities(usage, ['network']), set())
-        self.assertEqual(skill_tools.blocked_capabilities(usage, ['NETWORK ']), set())
-        # 不相干的权限名不算数。
-        self.assertEqual(skill_tools.blocked_capabilities(usage, ['web_fetch']), {'node:net'})
+        # GATED 档必须自己声明权限名。真实名单已清空（net/vm/worker_threads 都归了
+        # ACCOUNTED），所以这里注入一个假 token 验证机制本身没死。
+        original = skill_tools.GATED_BY_PERMISSION
+        try:
+            skill_tools.GATED_BY_PERMISSION = dict(original, **{'node:fake-net': 'network'})
+            self.assertEqual(skill_tools.blocked_capabilities(['node:fake-net']),
+                             {'node:fake-net'})
+            # 闸没死：声明了 GATED 映射里的权限名就放行。
+            self.assertEqual(skill_tools.blocked_capabilities(['node:fake-net'], ['network']),
+                             set())
+            self.assertEqual(skill_tools.blocked_capabilities(['node:fake-net'], ['NETWORK ']),
+                             set())
+            # 不相干的权限名不算数。
+            self.assertEqual(skill_tools.blocked_capabilities(['node:fake-net'], ['web_fetch']),
+                             {'node:fake-net'})
+        finally:
+            skill_tools.GATED_BY_PERMISSION = original
 
     def test_safe_and_gated_partition_the_node_builtins(self):
         self.assertFalse(skill_tools.NODE_BUILTIN_SAFE & set(skill_tools.NODE_BUILTIN_GATED))
         self.assertIn('node:fs', skill_tools.NODE_BUILTIN_SAFE)
         self.assertIn('node:fs/promises', skill_tools.NODE_BUILTIN_SAFE)
         self.assertIn('node:path', skill_tools.NODE_BUILTIN_SAFE)
-        self.assertEqual(skill_tools.NODE_BUILTIN_GATED['node:net'], 'network')
+        # 产品行为变化（W8b）：出网/线程/vm 也改归 ACCOUNTED。真实市场 379 个 zip 里
+        # 声明过 network/worker_threads/vm 的是 0 个，留成 GATED 等于永久阻断；宿主本身
+        # 就是 Node，注册期挡不住代码自己 import()，只挡得住想用它的包。
+        self.assertEqual(skill_tools.NODE_BUILTIN_GATED, {})
+        self.assertIn('node:net', skill_tools.NODE_BUILTIN_ACCOUNTED)
         # 产品行为变化（W8a）：node:child_process 不再按权限名闸住，改登记为「放行但记账」
         # ——市场上 379 个 zip 里声明 process_spawn 的是 0 个，要求声明等于永久阻断。
         self.assertIn('node:child_process', skill_tools.NODE_BUILTIN_ACCOUNTED)
@@ -288,22 +295,24 @@ class EligibleTest(TempCase):
         self.install('extra-api')
 
     def run_eligible(self, allow=None):
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             return skill_tools.eligible_skills(allow=allow, manifest=self.manifest,
                                                runtime=self.runtime)
 
     def test_default_keeps_t1_and_t2(self):
-        # 产品行为变化（W8a）：DEFAULT_TIERS 加进 'T2-web-fetch'，needs-web 由「tier 挡」
-        # 变成可注册，默认工具数由 1 变 2。
+        # 产品行为变化（Q1=C）：ctx 对象成员不再拦包，只记进 plan['blocked'] 供审计；
+        # 真缺的 node:/npm: 仍由 blocked_capabilities 判。needs-ctx 因此进默认清单。
         result = self.run_eligible()
         self.assertEqual(sorted(item['id'] for item in result['eligible']),
-                         ['clean', 'needs-web'])
-        self.assertEqual(result['counts']['tools'], 2)
+                         ['clean', 'needs-ctx', 'needs-web'])
+        self.assertEqual(result['counts']['tools'], 3)
+        plans = {item['id']: item for item in result['eligible']}
+        self.assertEqual(plans['needs-ctx']['blocked'], ['onebot'])
+        self.assertEqual(plans['needs-ctx']['released'], [])
         reasons = {item['id']: item['reason'] for item in result['skipped']}
         self.assertIn('结构性不可用', reasons['host-source'])
         self.assertIn('结构性不可用', reasons['broken'])
         self.assertIn('tier T3-extra-api', reasons['extra-api'])
-        self.assertIn('ctx/宿主 API', reasons['needs-ctx'])
         # T2 不再出现在 skipped 里（这里断言它没被别的闸顺手带出来）。
         self.assertNotIn('needs-web', reasons)
 
@@ -323,16 +332,25 @@ class EligibleTest(TempCase):
                                            hostImports=['../../src/tools.js']))
         self.install('with-req')
         self.install('with-import')
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             result = skill_tools.eligible_skills(manifest=manifest, runtime=self.runtime)
         reasons = {item['id']: item['reason'] for item in result['skipped']}
         self.assertIn('requires', reasons['with-req'])
-        self.assertIn('宿主源码模块', reasons['with-import'])
+        # 有源码可扫时不再按清单的 hostImports 判死：判据是源码本身（见 _skill_plan 注释）。
+        self.assertIn('with-import', [item['id'] for item in result['eligible']])
+
+    def test_host_imports_block_when_no_source_to_scan(self):
+        manifest = manifest_of(skill_entry('no-source', tools=['no-source__p'],
+                                           hostImports=['../../src/tools.js']))
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
+            result = skill_tools.eligible_skills(manifest=manifest, runtime=self.runtime)
+        reasons = {item['id']: item['reason'] for item in result['skipped']}
+        self.assertIn('宿主源码模块', reasons['no-source'])
 
     def test_tool_name_without_prefix_is_skipped(self):
         manifest = manifest_of(skill_entry('flat', tools=['ping']))
         self.install('flat')
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             result = skill_tools.eligible_skills(manifest=manifest, runtime=self.runtime)
         self.assertEqual(result['eligible'], [])
         self.assertIn('不是运行时全名', result['skipped'][0]['reason'])
@@ -360,7 +378,7 @@ class RegisterTest(TempCase):
     def register(self, **kwargs):
         options = dict(manifest=self.manifest, runtime=self.runtime, **self.env)
         options.update(kwargs)
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             return skill_tools.register_skills(**options)
 
     def test_prefix_mismatch_registers_runtime_full_names(self):
@@ -502,7 +520,7 @@ class RegisterSchemaTest(TempCase):
     def register(self, manifest, **kwargs):
         options = dict(manifest=manifest, runtime=self.runtime, **self.env)
         options.update(kwargs)
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             return skill_tools.register_skills(**options)
 
     def test_parameters_extracted_from_source(self):

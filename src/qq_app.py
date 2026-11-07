@@ -58,6 +58,7 @@ from . import skill_manifest
 from . import tool_loop
 from . import agent_qq_ops
 from .log_api import data_dir_of, log_event as _log_event
+from .prompt_budget import allocate as allocate_prompt
 from .prompt_budget import compose as compose_prompt, summary as prompt_summary, trim_history
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -515,6 +516,7 @@ class QQRuntime:
         elif self.style.active_name not in self.style._styles:
             self.style.set_active(DEFAULT_PERSONA)
         self.ai = self._make_ai()
+        self._attach_qqagent_llm(self.ai)
         self.official = self._build_official_bots()
         self.official_tasks = []
         self.onebot = OneBotQQ()
@@ -590,6 +592,8 @@ class QQRuntime:
         # 回复循环的唤醒闸门：ingest 一到就 set，循环立刻开始处理，不再靠轮询等待。
         self._wake = asyncio.Event()
         self._vision_tasks = set()
+        self._media_tasks = set()        # media.download 的后台下载任务
+        self._feedback_tasks = set()     # llm.endpoint-feedback 的后台回报任务
         self._status_last = {}
         # 最近 30 条回复的时延拆解（"速度"查询与「快速回复」档位用真实数字说话）
         self.latency = []
@@ -1701,6 +1705,42 @@ class QQRuntime:
             return None
         return plugin if callable(getattr(plugin, 'list_tools', None)) else None
 
+    def _attach_qqagent_llm(self, engine):
+        """把 llm.endpoint-pick / llm.endpoint-feedback 挂到引擎上。
+
+        引擎自己不 import 插件模块（避免反向耦合），只认这两个可调用属性；两个都
+        是 None 时行为与改动之前完全一样。桥没装/被停用时 `_qqagent()` 返回 None，
+        这里照样挂，只是每次调用立刻返回空 —— 关掉扩展不需要重启。
+        """
+        if engine is None:
+            return engine
+
+        async def _picker(model):
+            plugin = self._qqagent()
+            probe = getattr(plugin, 'endpoint_pick_async', None)
+            if not callable(probe):
+                return {}
+            return await probe(str(model or ''), self) or {}
+
+        def _reporter(payload):
+            plugin = self._qqagent()
+            probe = getattr(plugin, 'endpoint_feedback_async', None)
+            if not callable(probe):
+                return None
+            # 引擎在请求结束处同步调用；这里起个任务回报，别让一次 node 冷启动
+            # （约 1.4 秒）拖住本轮回复。任务留个引用，避免被 GC 掉。
+            task = asyncio.create_task(probe(dict(payload or {}), self))
+            self._feedback_tasks.add(task)
+            task.add_done_callback(self._feedback_tasks.discard)
+            return task
+
+        try:
+            engine.endpoint_picker = _picker
+            engine.endpoint_reporter = _reporter
+        except Exception as exc:
+            logger.warning("llm.endpoint 能力挂载跳过：{}", exc)
+        return engine
+
     def _qqagent(self):
         """能力桥实例；没装/没加载/被停用时返回 None。
 
@@ -1771,6 +1811,115 @@ class QQRuntime:
                   f"{probe_message['sender_id'] or '?'} 提成了主人" + (f"：{reason}" if reason else "")
                   + (f"（provider：{provider}）" if provider else ""))
         return True
+
+    async def _qqagent_speaker_label(self, message):
+        """message.speaker-format：给这一轮发言人算一个标签，塞进 message 供 turn_text 用。
+
+        扩展不表态/报错一律返回空串，`chat_state.turn_text` 看到空串就退回原来的
+        `发送者资料：{...}` 拼法 —— 与宿主 `prompt.js:307` 的兜底语义一致。
+        """
+        plugin = self._qqagent()
+        probe = getattr(plugin, 'speaker_format', None)
+        if not callable(probe):
+            return ''
+        entry = {'sender_id': person_of(message),
+                 'name': str(message.get('sender_name') or message.get('sender') or '')[:80],
+                 'kind': str(message.get('kind') or ''),
+                 'target': str(message.get('target') or ''),
+                 'self_id': str(message.get('self_id') or '')}
+        try:
+            return str(await probe(entry, self) or '').strip()
+        except Exception as exc:
+            self.note(f"QQ Agent message.speaker-format 跳过：{type(exc).__name__}")
+            return ''
+
+    def _has_media_link(self, message):
+        """这条消息里有没有值得交给 media.download 的链接。
+
+        只在**装了桥且桥上有 media.download 能力**时才为真 —— 否则每条带链接的
+        消息都会多起一个后台任务，最后什么也不做。
+        """
+        plugin = self._qqagent()
+        if not callable(getattr(plugin, 'media_download', None)):
+            return False
+        try:
+            from .plugins.qqagent_bridge import _extract_media_urls
+            return bool(_extract_media_urls(str((message or {}).get('text') or '')))
+        except Exception:
+            return False
+
+    async def _qqagent_media(self, message):
+        """media.download：让扩展认领消息里的链接，认领成功就把文件发出去。
+
+        宿主 `app.js:1000` 也是这个位置（收到消息、还没进模型）。这里只做两件事：
+        把结果里 `ok` 的项交给发送通道，把 `friendly` 失败文案发出去 —— 与
+        `media-links.js` 的 `dispatchMediaLinks` 保持同样的三种状态（handled /
+        failed / skipped）。所有异常都吞掉，下载失败绝不能影响正常回话。
+        """
+        plugin = self._qqagent()
+        probe = getattr(plugin, 'media_download', None)
+        if not callable(probe):
+            return
+        try:
+            outcome = await probe(message, self) or {}
+        except Exception as exc:
+            self.note(f"QQ Agent media.download 跳过：{type(exc).__name__}")
+            return
+        for item in outcome.get('handled') or []:
+            try:
+                await self._deliver_media(message, item)
+            except Exception as exc:
+                self.note(f"media.download 已下载但发送失败：{type(exc).__name__}")
+        for item in outcome.get('failed') or []:
+            value = item.get('value') if isinstance(item.get('value'), dict) else {}
+            friendly = str(value.get('friendly') or '').strip()
+            if friendly:
+                try:
+                    await self._send_plain(message, friendly[:300])
+                except Exception as exc:
+                    self.note(f"media.download 失败提示未发出：{type(exc).__name__}")
+
+    async def _send_plain(self, message, text):
+        """按当前模式发一条纯文本（不经回复链，不带 meta）。"""
+        kind = str(message.get('kind') or '')
+        target = str(message.get('target') or '')
+        if not kind or not target or not text:
+            return
+        if self.mode == 'official':
+            await self.official.send_active(kind, target, text)
+        elif self.mode == 'qqbridge':
+            await self.bridge.send_active(kind, target, text)
+        else:
+            await self.onebot.send({'kind': kind, 'target': target,
+                                    'id': f'{kind}:{target}'}, text)
+
+    async def _deliver_media(self, message, item):
+        """把 media.download 下载好的文件按消息段发出去。
+
+        `build_reply_segments` 的白名单里没有 video（视频只走 bilibili_share 的
+        特批路径），所以这里直接拼 OneBot 段调用 `transport.call`；图片同样走这条，
+        省得再给 plugin_segments 开新口子。
+        """
+        value = item.get('value') if isinstance(item.get('value'), dict) else {}
+        path = str(value.get('filePath') or '').strip()
+        if not path or not Path(path).exists():
+            return
+        kind = str(message.get('kind') or '')
+        target = str(message.get('target') or '')
+        if not kind or not target:
+            return
+        seg_type = 'video' if str(value.get('kind') or '') == 'video' else 'image'
+        transport = (self._official_for(message) if self.mode == 'official'
+                     else self.bridge if self.mode == 'qqbridge' else self.onebot)
+        call = getattr(transport, 'call', None)
+        if not callable(call):
+            # 官方模式没有 OneBot action：官方接口发视频要 media_id 上传，这里不做，
+            # 只把链接回给用户，别让"下载成功了却什么都不发生"。
+            await self._send_plain(message, str(value.get('title') or path))
+            return
+        await call('send_group_msg' if kind == 'group' else 'send_private_msg',
+                   {'group_id' if kind == 'group' else 'user_id': int(target),
+                    'message': [{'type': seg_type, 'data': {'file': path}}]})
 
     def _tool_warm_audit(self, extra):
         """追加一条 phase='warm' 的工具环审计；写失败只是少一条记录。"""
@@ -2404,6 +2553,13 @@ class QQRuntime:
                         _t_plugin = time.time()
                         message = await self._coalesce_pending(key,message,room,created)
                         await self.plugins.run_on_prepare(message,self)
+                        # media.download：消息里带链接时交给扩展下载（宿主 app.js:1000
+                        # 的同一个位置）。放后台跑，别让下载拖住回复；下载好了由
+                        # _qqagent_media 自己发出去。
+                        if not message.get('_direct_reply') and self._has_media_link(message):
+                            _media_task = asyncio.create_task(self._qqagent_media(message))
+                            self._media_tasks.add(_media_task)
+                            _media_task.add_done_callback(self._media_tasks.discard)
                         # message.gate：扩展判断"这条要不要回"。被挡下就是这轮不回复（不是
                         # 报错），审计里写明被哪个扩展挡的；桥关/扩展挂/超时一律放行（fail-open）。
                         _gate = await self._qqagent_gate(message)
@@ -2432,6 +2588,20 @@ class QQRuntime:
                                 continue
                         from .persona_bindings import resolve_persona
                         _persona = resolve_persona(self,message)
+                        # 绑定里写的人设名不存在时，resolve_persona 会在 reason 里带 missing:；
+                        # 静默回落会让用户以为绑定生效了，实际整段对话换成了默认人设。
+                        _persona_reason = str(message.get('_persona_reason') or '')
+                        if 'missing:' in _persona_reason:
+                            self.note(f"会话绑定的人设不存在（{_persona_reason.split('missing:',1)[1]}），本轮按默认人设回复")
+                        # 绑到违禁词人设时不能一声不响地用回默认：那个群的人会以为
+                        # 绑的还是原来那个人设。set_active 拒绝切换也是这个道理。
+                        if 'blocked:' in _persona_reason:
+                            self.note(f"会话绑定的人设命中违禁词（{_persona_reason.split('blocked:',1)[1]}），本轮按默认人设回复")
+                        # 绑定与关键词指向不同人设时绑定优先，但要说出来：用户在别的会话里
+                        # 看到的是关键词效果，回到这个群又变回绑定人设，不提示就像人设串了。
+                        if 'keyword:' in _persona_reason:
+                            self.note(f"这句话命中人设关键词「{_persona_reason.split('keyword:',1)[1]}」，"
+                                      f"但本会话绑定的是「{_persona.display_name or _persona.name}」，按绑定回复")
                         if _persona.name != self.style.active_name:
                             self.note(f"按会话绑定或人设关键词，本轮使用「{_persona.display_name or _persona.name}」")
                         # message.identity：机器人是谁（selfId/昵称/人设名）可以由扩展覆盖；
@@ -2463,6 +2633,13 @@ class QQRuntime:
                         if message.get('notice') == 'poke' or message.get('_soft_poke'):
                             conversation = []
                         _image_context = any('[图片识别' in str(turn.get('content') or '') for turn in conversation)
+                        # message.speaker-format：扩展可以改写这一轮发言人的标签
+                        # （宿主 prompt.js:307 的同一个位置）。空串 = 不表态，走原拼法。
+                        # 必须写在 current_input 之前：那一份是 message 的浅拷贝，
+                        # 之后再改 message 不会回填进去（标签就会静默丢失）。
+                        _speaker_label = await self._qqagent_speaker_label(message)
+                        if _speaker_label:
+                            message['_speaker_label'] = _speaker_label
                         # 当前轮标注只在本次识图完成后追加，不能先带入上次重试留下的结果。
                         current_input = {k: v for k, v in message.items()
                                          if k not in ('vision_description', 'vision_status', 'vision_cache_hit')}
@@ -2508,10 +2685,16 @@ class QQRuntime:
                         _plugin_blocks = []
                         _plugin_text = "\n".join(str(_hints.get(key) or "") for key in
                                                   ("extra_system", "volatile_system")).strip()
+                        # 记忆保底：插件块先按「剩余额度减去记忆保底」封顶，否则一条爱写长文
+                        # 的插件能把记忆额度吃到零，而记忆是这一轮最该保住的内容。
+                        _mem_floor = 300
+                        _plugin_room = max(0, self._prompt_chars('ai.prompt_budget', 6000) - len(_sys))
+                        if _plugin_room > _mem_floor:
+                            _plugin_room -= _mem_floor
                         if _plugin_text and self._prompt_chars('ai.plugin_chars', 800) > 0:
                             _plugin_block, _plugin_stats = compose_prompt(
                                 [('插件', _plugin_text, self._prompt_chars('ai.plugin_chars', 800), 1)],
-                                limit=max(0, self._prompt_chars('ai.prompt_budget', 6000) - len(_sys)))
+                                limit=_plugin_room)
                             if _plugin_block:
                                 _sys += "\n" + _plugin_block
                             _plugin_blocks = _plugin_stats['blocks']
@@ -2552,11 +2735,14 @@ class QQRuntime:
                             _diary = ''
                             if _mem_first and message.get('kind') == 'private':
                                 _diary = self.unified_memory.diary_tail(self._prompt_chars('ai.diary_chars', 700))
-                            _block, _stats = compose_prompt(
+                            # 记忆给 300 字保底：预算紧时先整块丢日记，再缩记忆，
+                            # 不让两轮长日记把「主人说过什么」挤到零。
+                            _block, _stats = allocate_prompt(
                                 [('记忆', _mem_text, self._prompt_chars('ai.memory_chars', 1200), 2),
                                  ('日记', ('【最近日记】\n' + _diary) if _diary else '',
                                   self._prompt_chars('ai.diary_chars', 700), 3)],
-                                limit=max(0, self._prompt_chars('ai.prompt_budget', 6000) - len(_sys)))
+                                limit=max(0, self._prompt_chars('ai.prompt_budget', 6000) - len(_sys)),
+                                minimums={'记忆': 300})
                             if _block:
                                 _sys += '\n' + _block
                             if _stats['blocks'] or _plugin_blocks:
@@ -2698,7 +2884,9 @@ class QQRuntime:
                             _persona_name = str(getattr(_persona, 'display_name', '') or
                                                 getattr(_persona, 'name', '') or '').strip()
                             _fallback = f"我是{_persona_name}。" if _persona_name else ""
-                            _cleaned, _leaked = _scrub_identity(reply, fallback=_fallback)
+                            # 人设名要传进去：模型说「我是Alice」是自报家门，不是身份泄漏。
+                            _cleaned, _leaked = _scrub_identity(
+                                reply, fallback=_fallback, personas=(_persona_name,))
                             if _leaked:
                                 self.note("模型自称外部产品/模型名，已按人设改写这一句")
                                 reply = _cleaned
@@ -2886,8 +3074,8 @@ class QQRuntime:
     def has_plugin_outgoing(self,pid,kind,target):
         return bool(self.db.execute("SELECT 1 FROM chat_outbox o JOIN plugin_outbox p ON o.key=p.key WHERE p.plugin=? AND o.mode=? AND o.account=? AND o.kind=? AND o.target=? AND o.state IN ('pending','sending')",(pid,self.mode,self.account(),kind,str(target))).fetchone())
 
-    def queue_plugin_outgoing(self,pid,key,kind,target,text):
-        if not self.queue_outgoing(key,kind,target,text):return False
+    def queue_plugin_outgoing(self,pid,key,kind,target,text,guard=True):
+        if not self.queue_outgoing(key,kind,target,text,guard=guard):return False
         self.db.execute('INSERT INTO plugin_outbox VALUES(?,?,?)',(self._outgoing_key(key),pid,self.last_interaction(kind,target) or 0));self.db.commit();return True
 
     def _outgoing_key(self, key):
@@ -2907,9 +3095,50 @@ class QQRuntime:
             return False
         return self.conversation_allowed(kind, target)
 
-    def queue_outgoing(self,key,kind,target,text):
+    def outgoing_persona_names(self,kind,target):
+        """主动消息这一轮「是谁在说话」：有会话绑定就用绑定的，否则用当前全局人设。
+
+        这里刻意不看 message 文本去 match_keywords：主动消息的正文是机器人自己写的，
+        拿它去选人设等于让人设被自己生成的句子决定。"""
+        names=[]
+        try:
+            from .persona_bindings import bindings as _bindings
+            for row in _bindings(self):
+                if row.get('mode')!=self.mode or row.get('account')!=self.account():continue
+                if row.get('kind')!=kind or row.get('target')!=str(target):continue
+                if row.get('user'):continue
+                style=self.style._styles.get(row.get('persona'))
+                if style is None:continue
+                names.append(str(getattr(style,'display_name','') or ''))
+                names.append(str(getattr(style,'name','') or ''))
+        except Exception:
+            pass
+        try:
+            active=self.style.get()
+            names.append(str(getattr(active,'display_name','') or ''))
+            names.append(str(getattr(active,'name','') or ''))
+        except Exception:
+            pass
+        return tuple(name for name in names if name)
+
+    def queue_outgoing(self,key,kind,target,text,guard=True):
         if not self.can_send_proactive(kind,target) or not str(text).strip():
             return False
+        if guard:
+            # 主动消息同样要过身份闸：正常回复路径会清掉「我是ChatGPT」这类句子，
+            # 但主动私信/暖场/定时播报是另一条路，不在这里拦就等于漏了。
+            try:
+                from .identity_guard import scrub as _scrub_identity
+                _names=self.outgoing_persona_names(kind,target)
+                _fallback=f"我是{_names[0]}。" if _names else ""
+                _cleaned,_leaked=_scrub_identity(text,fallback=_fallback,personas=_names)
+                if _leaked:
+                    self.note("主动消息自称外部产品/模型名，已按人设改写这一句")
+                    text=_cleaned
+            except Exception as _identity_exc:
+                self.note(f"主动消息身份检查跳过：{type(_identity_exc).__name__}")
+            if not str(text).strip():
+                return False
         inserted = self.db.execute('INSERT OR IGNORE INTO chat_outbox(key,mode,account,kind,target,text,state,created) '
             "VALUES(?,?,?,?,?,?,'pending',?)",(self._outgoing_key(key),self.mode,self.account(),kind,str(target),str(text)[:2000],time.time())).rowcount
         self.db.commit()
@@ -3075,6 +3304,7 @@ class QQRuntime:
         async with self.ai_lock:
             await self.ai.close()
             self.ai = self._make_ai()
+            self._attach_qqagent_llm(self.ai)
         for client in list(getattr(self, 'official_bots', {}).values()):
             try:
                 await client.close()
@@ -3779,6 +4009,9 @@ def create_app(runtime=None):
     # logging 的 WARNING+ 镜像进同一个日志库；同一 AppLog 重复挂只保留一个 handler。
     from .log_api import register as install_log_routes
     install_log_routes(app)
+    # 心情系统面板（/heart + /api/heart/*）：页面留在插件包里，这里只发文件与转发动作。
+    from .heart_api import register as install_heart_routes
+    install_heart_routes(app)
     from .app_log import default_app_log, install_logging_handler
     _log_bot = runtime if runtime is not None else getattr(app.state, 'bot', None)
     install_logging_handler(default_app_log(data_dir_of(_log_bot) or None), level='WARNING')
@@ -3924,11 +4157,18 @@ def create_app(runtime=None):
         if not app_exe:
             progress.fail("当前是源码运行，不能一键覆盖")
             raise HTTPException(400, "当前是源码运行，不能一键覆盖；请下载安装包手动安装")
+        # 发布方没给哈希时，check_update 会置 needs_confirmation=True。只有用户在
+        # 控制台明确点了「仍然继续」才把 allowUnverified 带上来，后端才放行；
+        # 否则 download_update 自己抛 UNVERIFIED_REASON，请求 400 而不是静默安装。
+        _allow_unverified = body.get("allowUnverified") is True
         try:
             download = await asyncio.to_thread(
-                app_updater.download_update, info, progress=progress)
+                app_updater.download_update, info, progress=progress,
+                allow_unverified=_allow_unverified)
+            # info 传进去，退出后的 update-<pid>.log 才有仓库/版本/资产/校验四要素。
             script = await asyncio.to_thread(
-                app_updater.build_update_script, download["path"], app_exe, os.getpid())
+                app_updater.build_update_script, download["path"], app_exe, os.getpid(),
+                None, info)
             await asyncio.to_thread(app_updater.launch_update_script, script)
         except ValueError as exc:
             progress.fail(str(exc))
@@ -5051,7 +5291,11 @@ def create_app(runtime=None):
         if learning is None:
             from .agent_learning import AgentLearning
             base = pathlib.Path(getattr(app.state.bot.config, 'config_path', 'config.yaml')).parent
-            learning = AgentLearning(base / 'agent_learning.json')
+            # 与 console_agent.learning 同一口径：落到当前人设的学习库，别和默认库串。
+            # 人设名要先归一：默认人设（含 tsundere_whale_girl）落回原文件，别造新库。
+            from .persona_scope import active_scope
+            _persona = active_scope(app.state.bot)
+            learning = AgentLearning(base / 'agent_learning.json', _persona)
             app.state.agent_learning = learning
         try:
             result = await asyncio.to_thread(

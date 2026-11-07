@@ -28,12 +28,13 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from src import pack_import, plugin_installer  # noqa: E402
+from src import pack_import, plugin_installer, skill_tools  # noqa: E402
 
 PY_ENTRY = '''from src.plugins import PluginBase, PluginMeta
 
@@ -254,6 +255,96 @@ class GbkSource(PackCase):
         text = Path(str(landed["landed"])).read_text(encoding="utf-8")
         self.assertIn("中文说明", text)
         self.assertIn("PluginBase", text)
+
+
+JS_REGISTER = "registerTool({name:'ping', description:'p', parameters:{type:'object'}});\n"
+
+
+class StaticLoadStage(PackCase):
+    """load 的 stage / checked / warnings：静态分层结论与运行期放行闸同一口径。
+
+    ok 不再各自比对 "T1-ready"，而是引用 skill_tools.DEFAULT_TIERS，所以 T2-web-fetch
+    也必须 ok=True —— 预检、安装、候选列表三处结论一致才叫「统一」。
+    """
+
+    def skill_zip(self, name: str, skill_id: str, **fields) -> Path:
+        manifest = {"id": skill_id, "name": skill_id, "version": "1.0.0"}
+        manifest.update(fields)
+        return self.make_zip(name, {"pkg/skill.json": self.manifest(**manifest),
+                                    "pkg/index.js": JS_REGISTER})
+
+    def runtime(self):
+        return SimpleNamespace(data_root=str(self.root / "rt"))
+
+    def test_t2_tier_agrees_across_inspect_install_and_eligible(self):
+        pack = self.skill_zip("t2.zip", "edge_t2", permissions=["web_fetch"])
+        got = pack_import.inspect(pack)
+        self.assertEqual(got["kind"], "skill")
+        self.assertTrue(got["load"]["ok"], got["load"])
+        self.assertEqual(got["load"]["code"], "T2-web-fetch")
+        self.assertEqual(got["load"]["stage"], "static-registerable")
+        self.assertEqual(got["load"]["checked"], "static-classify")
+
+        runtime = self.runtime()
+        landed = pack_import.install(pack, confirmed=True, skills_runtime=runtime)
+        self.assertTrue(landed["ok"], landed["problems"])
+        self.assertTrue(landed["load"]["ok"], landed["load"])
+        self.assertEqual(landed["load"]["code"], got["load"]["code"])
+        self.assertEqual(landed["load"]["stage"], got["load"]["stage"])
+
+        market = self.root / "market"
+        market.mkdir()
+        manifest = {"skills": [{"id": "edge_t2", "tier": landed["load"]["code"], "name": "T2",
+                                "tools": [{"name": "edge_t2__ping", "description": "p"}]}]}
+        chosen = skill_tools.eligible_skills(manifest=manifest, runtime=runtime, market=market)
+        self.assertEqual([one["id"] for one in chosen["eligible"]], ["edge_t2"], chosen["skipped"])
+
+    def test_missing_ctx_is_a_warning_not_a_block(self):
+        pack = self.make_zip("t2-ctx.zip", {
+            "pkg/skill.json": self.manifest(id="edge_ctx", name="缺 ctx", version="1.0.0",
+                                            permissions=["web_fetch"]),
+            "pkg/index.js": JS_REGISTER + "ctx.sender.sendImage('x');\n",
+        })
+        got = pack_import.inspect(pack)
+        self.assertTrue(got["load"]["ok"], got["load"])
+        self.assertEqual(got["load"]["stage"], "static-registerable")
+        self.assertTrue(any("sender" in one for one in got["load"]["warnings"]), got["load"])
+
+    def test_t6_tier_blocks_with_reason(self):
+        pack = self.make_zip("t6.zip", {
+            "pkg/skill.json": self.manifest(id="edge_t6", name="缺入口", version="1.0.0"),
+        })
+        got = pack_import.inspect(pack)
+        self.assertEqual(got["kind"], "skill")
+        self.assertFalse(got["load"]["ok"], got["load"])
+        self.assertEqual(got["load"]["code"], "T6-disabled")
+        self.assertEqual(got["load"]["stage"], "static-blocked")
+        self.assertEqual(got["load"]["error"], "no-entry")
+
+    def test_t6_install_error_names_the_structural_reason(self):
+        """装也装得住，但 load.error 必须是分层原因，不能拿「默认停用」顶掉。"""
+        pack = self.make_zip("t6-install.zip", {
+            "pkg/skill.json": self.manifest(id="edge_t6i", name="缺入口", version="1.0.0"),
+        })
+        landed = pack_import.install(pack, confirmed=True, skills_runtime=self.runtime())
+        self.assertTrue(landed["ok"], landed["problems"])
+        self.assertFalse(landed["load"]["ok"], landed["load"])
+        self.assertEqual(landed["load"]["stage"], "static-blocked")
+        self.assertIn("结构性不可用", landed["load"]["error"])
+        self.assertNotIn("默认停用", landed["load"]["error"])
+        self.assertTrue(landed["installed_but_disabled"])
+
+    def test_load_keys_and_top_level_schema_hold(self):
+        got = pack_import.inspect(self.skill_zip("keys.zip", "edge_keys"))
+        self.assertEqual(len(got), 19, sorted(got))
+        self.assertEqual(sorted(got["load"]),
+                         ["checked", "code", "error", "ok", "stage", "warnings"])
+        self.assertIsInstance(got["load"]["ok"], bool)
+        self.assertIsInstance(got["load"]["error"], str)
+        self.assertIsInstance(got["load"]["code"], str)
+        self.assertIsInstance(got["load"]["stage"], str)
+        self.assertIsInstance(got["load"]["checked"], str)
+        self.assertIsInstance(got["load"]["warnings"], list)
 
 
 if __name__ == "__main__":

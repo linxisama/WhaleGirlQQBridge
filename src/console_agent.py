@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import HTTPException, Request
 
+from . import persona_scope
 from .agent_learning import AgentLearning
 from .agent_admin import AgentAdmin
 from .agent_scheduler import ACTIONS
@@ -40,6 +41,8 @@ DEFAULTS = {'reply_timeout': 20, 'reply_timeout_retry': True, 'reply_max_tokens'
             'context_budget_tokens': 2200, 'history_limit': 24,
             'adaptive_max_tokens': True}
 TTL = 600
+# 学习库缓存上限：人设可以随便加，每个都常驻一个 json 句柄不划算。
+LEARNING_CACHE_LIMIT = 8
 BUSY = {'planning', 'applying', 'undoing'}
 # 这些动作会直接碰本机（启停服务、开窗口、敲键盘、截图），执行前必须由用户点一次确认。
 DANGEROUS = frozenset({'service', 'open_path', 'open_url', 'type_text', 'hotkey', 'screenshot'})
@@ -210,6 +213,38 @@ def note_digest(text):
 
 
 class ConsoleAgent:
+    @property
+    def learning(self):
+        """当前人设的学习库。默认人设仍用原文件，其它人设各一份。
+
+        不同人设的语气、偏好、做过的操作都不一样，混在一个库里会让 A 学到的做法
+        被 B 直接复用 —— 最典型的是「把回复调快一点」学到的参数被另一个人设继承走。
+        默认人设保留原路径，老用户已有的学习记录不会凭空消失。
+        """
+        return self._learning_for(persona_scope.active_scope(self.bot))
+
+    def _learning_for(self, persona):
+        """取某个人设的学习库；默认人设（含 tsundere_whale_girl）都落回原文件。
+
+        缓存只留最近用过的几个：人设可以随便加，每个都常驻一个 sqlite/json 句柄
+        的话，切几十次人设就攒几十份。被淘汰的库里没有未落盘状态（每次写都 save），
+        下次用到重新打开即可。
+        """
+        name = persona_scope.scope(persona)
+        if not name:
+            return self._learning_base
+        store = self._learning_cache.get(name)
+        if store is None:
+            store = AgentLearning(self._learning_base.base_path, name)
+            if len(self._learning_cache) >= LEARNING_CACHE_LIMIT:
+                # dict 保持插入序，弹出最久没被访问的那个（命中时会重新插入）。
+                self._learning_cache.pop(next(iter(self._learning_cache)), None)
+            self._learning_cache[name] = store
+        else:
+            self._learning_cache.pop(name, None)
+            self._learning_cache[name] = store
+        return store
+
     def __init__(self, bot, scheduler=None):
         self.bot = bot
         self.scheduler = scheduler
@@ -217,7 +252,9 @@ class ConsoleAgent:
         self.tasks = set()
         self.history = []
         base = Path(getattr(bot.config, 'config_path', Path('config.yaml'))).parent
-        self.learning = AgentLearning(base / 'agent_learning.json')
+        # 学习库按人设隔离：默认人设仍用原文件，其它人设各存一份（见 learning 属性）。
+        self._learning_base = AgentLearning(base / 'agent_learning.json')
+        self._learning_cache = {}
         self.sessions = AgentSessionStore(base / 'agent_sessions.json')
         self.memory = UnifiedMemory(bot.db, getattr(bot, 'diary_path', None))
         self.admin = AgentAdmin(base / 'agent_admin.json')
@@ -1211,7 +1248,11 @@ def install_agent_routes(app):
         only_keys(data, ('target', 'kind'))
         try:
             target = text_field(data.get('target'), '学习目标', 2000)
-            result = LearningQueue(agent().bot.db).enqueue(target, str(data.get('kind') or 'web'))
+            # 学习任务跟着人设走：不同人设的偏好不同，学到的内容不该互相顶替。
+            # 先归一：默认人设入队也必须是 ''，否则消费端归一后查重键对不上。
+            _persona = persona_scope.active_scope(agent().bot)
+            result = LearningQueue(agent().bot.db).enqueue(
+                target, str(data.get('kind') or 'web'), persona=_persona)
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from None
         return {'success': True, **result}

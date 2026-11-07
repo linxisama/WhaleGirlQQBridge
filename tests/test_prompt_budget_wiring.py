@@ -158,6 +158,22 @@ class PromptBudgetWiringTests(unittest.TestCase):
         self.assertTrue(blocks['记忆']['dropped'])
         self.assertTrue(blocks['日记']['dropped'])
 
+    def test_plugin_cannot_starve_memory(self):
+        # 预算只够插件块：插件必须给记忆留出保底，否则「主人说过什么」被长插件挤到零。
+        self.bot.plugins.run_on_pre_ai_async = mock.AsyncMock(return_value={
+            'block': False, 'delay': 0, 'on_ready': None,
+            'extra_system': '插件要求的长说明。' * 200, 'volatile_system': ''})
+        self.bot.config.set('ai.plugin_chars', 4000)
+        self.bot.config.set('ai.prompt_budget', 900)
+        prompt = self.reply()
+        blocks = {item['name']: item for item in self.bot.prompt_stats['blocks']}
+        self.assertIn('记忆', blocks)
+        self.assertFalse(blocks['记忆']['dropped'], '插件不该把记忆挤掉')
+        self.assertIn('【长期记忆', prompt)
+        # 插件块被整块丢弃时 stats 里 chars 仍是截断后的原长（不是注入量），
+        # 所以这里断言 dropped，而不是拿 chars 当实际占用比。
+        self.assertTrue(blocks['插件']['dropped'], '插件要给记忆留 300 字保底，装不下就整块不注入')
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -68,12 +68,28 @@ if ($LASTEXITCODE -ne 0) { throw 'Application build failed' }
 $bundleDir = Join-Path $PSScriptRoot "dist/$version/WhaleGirlQQBridge"
 $bundleExe = Join-Path $bundleDir 'WhaleGirlQQBridge.exe'
 if (-not (Test-Path -LiteralPath $bundleExe -PathType Leaf)) { throw "onedir 产物缺失：$bundleExe" }
+# PyQt6 hook 会把整棵 Qt6 树收进来：语言包只留 qt_locale.py 用得到的几个，Qt6Pdf 全项目无引用。
+$qtTranslations = Join-Path $bundleDir '_internal/PyQt6/Qt6/translations'
+if (Test-Path -LiteralPath $qtTranslations -PathType Container) {
+    $keepQm = @('qtbase_zh_CN.qm', 'qt_zh_CN.qm', 'qtbase_en.qm', 'qt_en.qm')
+    Get-ChildItem -LiteralPath $qtTranslations -Filter '*.qm' -File |
+        Where-Object { $keepQm -notcontains $_.Name } |
+        Remove-Item -Force
+    if (-not (Test-Path -LiteralPath (Join-Path $qtTranslations 'qtbase_zh_CN.qm') -PathType Leaf)) { throw "Qt 中文翻译缺失：$qtTranslations" }
+}
+foreach ($dropRel in @('_internal/PyQt6/Qt6/bin/Qt6Pdf.dll', '_internal/PyQt6/Qt6/plugins/imageformats/qpdf.dll')) {
+    $dropPath = Join-Path $bundleDir $dropRel
+    if (Test-Path -LiteralPath $dropPath -PathType Leaf) { Remove-Item -LiteralPath $dropPath -Force }
+}
+
 # 使用说明随安装包落到程序目录，用户不用回仓库找。
 $docsTarget = Join-Path $bundleDir 'docs'
 if (Test-Path -LiteralPath $docsTarget) { Remove-Item -LiteralPath $docsTarget -Recurse -Force }
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'docs') -Destination $bundleDir -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'README.md') -Destination $bundleDir -Force
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'BUILDING.md') -Destination $bundleDir -Force
+# 对外插件清单：站方条目页靠它渲染「插件」一栏，随程序目录一起落盘。
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'plugins.json') -Destination $bundleDir -Force
 $bundleFiles = @(Get-ChildItem -LiteralPath $bundleDir -Recurse -File)
 Write-Host ("Bundle: dist/$version/WhaleGirlQQBridge  files=" + $bundleFiles.Count + "  exe=" + (Get-Item -LiteralPath $bundleExe).Length + " B")
 

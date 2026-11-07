@@ -11,6 +11,8 @@ import time
 import uuid
 from pathlib import Path
 
+from . import persona_scope
+
 ACTIONS = {
     'connection_check': '检查 QQ 连接',
     'daily_digest': '生成近 24 小时日报',
@@ -172,7 +174,7 @@ class AgentScheduler:
         failed = counts.get('failed', 0) + counts.get('uncertain', 0)
         text = (f"近 24 小时：收到 {total} 条，失败/待核实 {failed} 条，"
                 f"token 约 {tokens}；模型 {getattr(self.bot.ai, 'model', '')}；"
-                f"当前人设 {self.bot.style.active_name}。")
+                f"当前人设 {persona_scope.active_scope(self.bot) or '默认'}。")
         try:
             folder = Path(self.bot.root) / 'data' / 'agent_reports'
             folder.mkdir(parents=True, exist_ok=True)
@@ -234,7 +236,9 @@ class AgentScheduler:
         from .public_web import read_public
         import re as _re
         queue = LearningQueue(self.bot.db)
-        item = queue.next()
+        # 队列按人设分，但消费者只有一个：只取当前人设，切走人设后别人格排进去的任务
+        # 就永远不跑了。取任意人设最早的一条，落库时再按 item 自己的 persona 归档。
+        item = queue.next_any()
         if not item:
             return '网络学习队列为空。'
         try:
@@ -247,7 +251,10 @@ class AgentScheduler:
             from .agent_learning import AgentLearning
             from pathlib import Path
             base = Path(getattr(self.bot.config, 'config_path', 'config.yaml')).parent
-            learning = AgentLearning(base / 'agent_learning.json')
+            # 队列任务带 persona：学到的东西要落进排它的那个人格的学习库，
+            # 否则换个当前人设就会把别人的经验写混。
+            learning = AgentLearning(base / 'agent_learning.json',
+                                     persona_scope.scope(item.get('persona')))
             learning.learn_from_source('web', text[:300], detail='学习队列公开网页')
             try:
                 from .unified_memory import UnifiedMemory
@@ -269,7 +276,10 @@ class AgentScheduler:
         from .agent_learning import AgentLearning
         from .unified_memory import UnifiedMemory
         base = Path(getattr(self.bot.config, 'config_path', 'config.yaml')).parent
-        learning = AgentLearning(base / 'agent_learning.json')
+        # 聊天里学到的经验属于当时那个人设：共用一份库会让所有人格互相串经验，
+        # 也会让「切换人设」变得只换了口吻、经验还是别人的。
+        _persona = persona_scope.active_scope(self.bot)
+        learning = AgentLearning(base / 'agent_learning.json', _persona)
         memory = UnifiedMemory(self.bot.db, getattr(self.bot, 'diary_path', None))
         memory._sync_legacy()
         try:
@@ -350,8 +360,10 @@ class AgentScheduler:
             try:
                 memory = UnifiedMemory(self.bot.db, getattr(self.bot, 'diary_path', None))
                 # 不传 force：设置页开关与 rate 概率门都要真的生效。
+                # 按人设固化：默认人设走老目录，其它人设各写各的 personas/<slug>/。
                 info = agent_dream.consolidate(memory, self._data_dir(),
-                                               config=getattr(self.bot, 'config', None))
+                                               config=getattr(self.bot, 'config', None),
+                                               persona=persona_scope.active_scope(self.bot))
                 result = _dream_line(info)
             except Exception as exc:
                 result = _dream_line({'reason': 'error',
@@ -370,7 +382,8 @@ class AgentScheduler:
                 try:
                     memory = UnifiedMemory(self.bot.db, getattr(self.bot, 'diary_path', None))
                     data_dir = self._data_dir()
-                    prompt = agent_portrait.build_prompt(memory, data_dir)
+                    _persona = persona_scope.active_scope(self.bot)
+                    prompt = agent_portrait.build_prompt(memory, data_dir, persona=_persona)
                     text = await asyncio.wait_for(engine.chat(
                         [{'role': 'user', 'content': prompt}],
                         system_prompt='你在重写自己的「我是谁」，用第一人称，只输出正文。',
@@ -378,7 +391,7 @@ class AgentScheduler:
                     # 用 refresh 复用它的清洗、too_short 与落盘逻辑。
                     result = _portrait_line(agent_portrait.refresh(
                         memory, data_dir, generate=lambda _prompt: text,
-                        config=getattr(self.bot, 'config', None)))
+                        config=getattr(self.bot, 'config', None), persona=_persona))
                 except Exception as exc:
                     result = f'自画像重写失败：{type(exc).__name__}: {exc}'
                 finally:

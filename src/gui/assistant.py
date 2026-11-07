@@ -678,18 +678,44 @@ class AssistantTab(QWidget):
         self._request('local_agent', 'assistant/local-agent')
 
     def _show_local_agent(self, data):
+        # bot_state / bot_alive 是探活结果：配置登记齐全不等于 DSH 里此刻真能连上，
+        # 只报「已登记」会让用户以为接好了，实际控制台没开。
+        state = str(data.get('bot_state') or '')
+        alive = data.get('bot_alive')
+        # 探不通时必须带上探的地址：用户改了端口却以为没生效，是这类问题的第一大成因。
+        probed = str((data.get('bot_probe') or {}).get('url') or '').strip()
+        if state == 'broken':
+            alive_text = '配置不完整，DSH 里拉不起来'
+        elif alive is True:
+            alive_text = '控制台可达'
+        elif alive is False:
+            alive_text = '配置能启动，但控制台此刻探不通'
+            if probed:
+                alive_text += '（探的地址：%s）' % probed
+        else:
+            alive_text = '未配置 WHALE_BOT_URL，无法探活'
         lines = [
             'DSH 目录：' + str(data.get('dsh_home') or ''),
             'profile：' + str(data.get('profile') or ''),
             '记忆 MCP：' + ('已登记' if data.get('memory_bridge') else '未登记'),
             '控制 MCP：' + ('已登记' if data.get('bot_bridge') else '未登记'),
+            '控制台探活：' + alive_text,
             'QQBot 入口：' + ('已配置' if data.get('qqbot_entry') else '未配置'),
             'QQBot 插件：' + ('已安装' if data.get('qqbot_plugin_installed') else '未安装'),
             'QQBot 凭据：' + ('已填' if data.get('qqbot_credentials_configured') else '未填/待扫码'),
             '鲸鱼娘插件：' + ('已安装' if data.get('whalegirl_plugin_installed') else '未安装'),
             '',
-            str(data.get('hint') or ''),
         ]
+        alive_hint = str(data.get('bot_alive_hint') or '').strip()
+        if alive_hint:
+            lines.append(alive_hint)
+        problems = [str(item) for item in (data.get('bot_problems') or []) if str(item).strip()]
+        if problems:
+            lines.append('待处理：')
+            lines.extend('- ' + item for item in problems[:6])
+        hint = str(data.get('hint') or '').strip()
+        if hint:
+            lines.append(hint)
         tell(self, '本地 Agent 关联', '\n'.join(lines), ok_text='知道了')
 
     def open_admin(self):

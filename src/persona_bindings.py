@@ -19,17 +19,39 @@ def resolve_persona(runtime,message):
     kind=str(message.get('kind') or '')
     target=str(message.get('target') or '')
     sender=str(message.get('sender_id') or (target if kind=='private' else ''))
-    candidates=[]
+    candidates=[];missing=[];blocked=[]
     for row in bindings(runtime):
         if row.get('mode')!=runtime.mode or row.get('account')!=runtime.account():continue
         if row.get('kind')!=kind or row.get('target')!=target:continue
         if row.get('user') and row['user']!=sender:continue
         persona=runtime.style._styles.get(row.get('persona'))
-        if persona:candidates.append((bool(row.get('user')),persona))
-    persona=max(candidates,key=lambda r:r[0])[1] if candidates else (
-        runtime.style.match_keywords(str(message.get('text') or '')) or runtime.style.get())
+        if not persona:
+            missing.append(str(row.get('persona') or ''));continue
+        # 绑定不能绕过违禁词闸门：set_active 会拒绝切换的人设，经会话绑定直接取用
+        # 就等于绕过去了 —— 违禁词人设被绑到某个群，那个群就成了唯一不受管的地方。
+        if runtime.style.persona_violations(persona):
+            blocked.append(str(persona.name));continue
+        candidates.append((bool(row.get('user')),persona))
+    # 绑定里写的人设名不存在时不能静默回落：那会让整段对话悄悄换成人设，
+    # 用户看不出是绑定坏了还是关键词没命中。原因记进 message 供上层提示。
+    reason=''
+    if candidates:
+        persona=max(candidates,key=lambda r:r[0])[1];reason='binding'
+        # 绑定与关键词打架时，绑定赢（会话绑定是用户显式指定的），但冲突要留痕：
+        # 不然用户会奇怪「我在这个群设了人设，为什么她偶尔像另一个人」—— 那句话里
+        # 恰好有人设关键词，而绑定只在有绑定的会话里生效，别处仍按关键词走。
+        _by_key= runtime.style.match_keywords(str(message.get('text') or ''))
+        if _by_key is not None and _by_key.name != persona.name:
+            reason += '+keyword:' + str(_by_key.name)
+    else:
+        persona=runtime.style.match_keywords(str(message.get('text') or ''))
+        if persona:reason='keyword'
+        else:persona=runtime.style.get();reason='default'
+        if missing:reason+='+missing:'+','.join(sorted(set(missing))[:3])
+        if blocked:reason+='+blocked:'+','.join(sorted(set(blocked))[:3])
     message['_effective_persona']=persona.name
     message['_persona_bound']=bool(candidates)
+    message['_persona_reason']=reason
     return persona
 
 
@@ -63,8 +85,18 @@ def install_routes(app):
         bot=app.state.bot
         rows=[r for r in bindings(bot) if r.get('mode')==bot.mode and r.get('account')==bot.account()]
         recent=bot.db.execute("SELECT kind,room,sender,max(at) FROM inbound_audit WHERE mode=? AND kind IN ('group','private') GROUP BY kind,room,sender ORDER BY max(at) DESC LIMIT 100",(bot.mode,)).fetchall()
+        # 绑定不能绕过违禁词闸门（见 resolve_persona），所以这里把「失效的绑定」也报给前端：
+        # 否则用户看到一条绑定写得好好的，实际那个群一直用默认人设，没有任何地方提示。
+        bad={}
+        for row in rows:
+            persona=bot.style._styles.get(row.get('persona'))
+            if persona is None:
+                bad[row.get('persona')]='missing'
+            elif bot.style.persona_violations(persona):
+                bad[row.get('persona')]='blocked'
         return {'rows':[{k:r.get(k,'') for k in ('kind','target','user','persona')} for r in rows],
             'revision':revision(rows),'mode':bot.mode,'personas':[{'name':p.name,'display_name':p.display_name} for p in bot.style._styles.values()],
+            'invalid':bad,
             'recent':[dict(kind=k,target=str(room).removeprefix(k+':'),user=u or '') for k,room,u,_ in recent]}
 
     @app.post('/api/persona-bindings')

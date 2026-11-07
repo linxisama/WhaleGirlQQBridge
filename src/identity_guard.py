@@ -30,8 +30,21 @@ _AI_CLAIM = re.compile(
 _SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?~…\n])")
 
 
-def find_leaks(text: str) -> list[str]:
-    """返回命中的句子（空列表表示干净）。"""
+def _allowed(names) -> set:
+    """把人设名归一成可比对的集合（小写、去空白）。"""
+    return {str(item or "").strip().lower() for item in (names or ()) if str(item or "").strip()}
+
+
+def find_leaks(text: str, personas=()) -> list[str]:
+    """返回命中的句子（空列表表示干净）。
+
+    personas 是本轮可用的人设名（含 display_name）。第二分支匹配的是
+    「我是/我叫 + ASCII 名字」，它本来是用来抓 "我是ChatGPT" 的；但同一个句式
+    也是人设自报家门（"我是Alice"）。注释早就写明「只在名字不是人设时才算泄漏」，
+    实现却把所有不超过 12 字的 ASCII 名字一律判泄漏 —— 于是人设自称被整句删掉。
+    这里按注释的原意落地：命中名字属于本轮人设就放过。
+    """
+    allowed = _allowed(personas)
     leaks: list[str] = []
     for sentence in _SENTENCE_SPLIT.split(str(text or "")):
         probe = sentence.strip()
@@ -43,17 +56,23 @@ def find_leaks(text: str) -> list[str]:
             continue
         match = _AI_CLAIM.search(probe)
         if match:
-            # "我叫老鲸"这种自报人设的句子要放过：只在名字不是人设时才算泄漏。
-            name = (match.group(3) or "").strip()
+            # 名字在第 4 组。原来取 group(3)，那是「我是/我叫/我的名字是」这个动词，
+            # 长度永远不超过 12，于是每个匹配都被判泄漏 —— 人设自称被整句删掉。
+            name = (match.group(4) or "").strip()
+            if name and name.lower() in allowed:
+                continue          # 自报的是本轮人设名，不是泄漏
             if not name or len(name) <= 12:
                 leaks.append(probe)
     return leaks
 
 
-def scrub(text: str, fallback: str = "") -> tuple[str, bool]:
-    """去掉泄漏句。返回 ``(清理后的文本, 是否发生过清理)``。"""
+def scrub(text: str, fallback: str = "", personas=()) -> tuple[str, bool]:
+    """去掉泄漏句。返回 ``(清理后的文本, 是否发生过清理)``。
+
+    personas 原样传给 find_leaks：人设自称（"我是Alice"）不算泄漏。
+    """
     source = str(text or "").strip()
-    leaks = find_leaks(source)
+    leaks = find_leaks(source, personas)
     if not leaks:
         return source, False
     kept = [sentence for sentence in _SENTENCE_SPLIT.split(source)

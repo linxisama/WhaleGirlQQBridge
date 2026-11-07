@@ -51,13 +51,31 @@ export function createRoutes(deps) {
     qqPortableStatus, qqPortableLogs, launchPortableQQ, stopPortableQQ,
     visionScan,
     buildUsageStats, buildUsageBreakdown,
-    reloadSkills
+    reloadSkills,
+    sendLocalMessage, LOCAL_CHAT_KEY
   } = deps;
 
   // 小工具：读请求体（容错：没 body 当空对象）。
   // 但 readBody 明确标记的可暴露错误（400 非法 JSON / 413 过大）必须透传，
   // 否则会从"应返回 400"退化成静默当成空 patch。
   const bodyOf = (req) => readBody(req).catch((e) => { if (e?.expose) throw e; return {}; });
+
+  /**
+   * 本地聊天的开关由插件提供（capability: console.chat.meta）。
+   * 没装插件 / 插件被关掉 → 返回 null，相关接口一律 404，界面上的页签也不会出现。
+   */
+  function localChatMeta() {
+    try {
+      const providers = skillManager.getCapabilityProviders('console.chat.meta', {});
+      for (const p of providers || []) {
+        try {
+          const meta = typeof p?.fn === 'function' ? p.fn({}) : null;
+          if (meta && meta.enabled !== false) return { title: String(meta.title || '聊天') };
+        } catch { /* 提供者抛错 = 当作没这个能力 */ }
+      }
+    } catch { /* skillManager 还没就绪 */ }
+    return null;
+  }
 
   /**
    * Skill 可用性判断的运行期上下文。
@@ -82,6 +100,35 @@ export function createRoutes(deps) {
       }
     };
   };
+
+  /**
+   * 用当前消息重建本地聊天的长期记忆索引（memory-v2 的小时/日块）。
+   * 为什么需要：记忆块是从消息里摘出来的，消息删了/改了，块里还留着旧内容。
+   * 归纳本身不调模型（只是 who: text 拼接 + 关键词），所以重建很便宜，可以随手做。
+   */
+  let rebuildingLocal = null;
+  async function rebuildLocalMemory() {
+    if (rebuildingLocal) return rebuildingLocal;   // 同时只跑一份，连点也不会打架
+    rebuildingLocal = (async () => {
+      try {
+        const mod = await import('../plugins/conversation-memory/lib/consolidator.js');
+        const c = new mod.Consolidator({
+          messagesDir: path.join(DATA_DIR, 'messages'),
+          memoryRoot: path.join(DATA_DIR, 'memory-v2')
+        });
+        const out = await c.consolidateChat(LOCAL_CHAT_KEY, { force: true });
+        log(`[local-chat] 记忆已重建：${out?.chunks ?? 0} 块 / ${out?.added ?? 0} 条`);
+        return { ok: true, chunks: out?.chunks ?? 0, added: out?.added ?? 0 };
+      } catch (e) {
+        // 插件没装/被改名/内部结构变了 —— 都不该拖累聊天本身
+        log(`[local-chat] 记忆重建跳过：${e?.message ?? e}`);
+        return { ok: false, error: String(e?.message ?? e) };
+      } finally {
+        rebuildingLocal = null;
+      }
+    })();
+    return rebuildingLocal;
+  }
 
   return [
     // ── 状态 / 数据目录 / 重置 ─────────────────────────────────────────
@@ -979,6 +1026,45 @@ export function createRoutes(deps) {
       }
     },
     {
+      // 插件自定义动作：页面上的按钮（由插件注入的脚本绘制）点下来打到这类端点。
+      // body: 任意 JSON，原样交给插件的 runAction(key, args)。
+      //
+      // 为什么需要它：扩展系统**没有前端钩子**，插件碰不到页面 DOM。官方做法是
+      // "插件往 ui/ 注入脚本 + 让页面重载"，于是那条从"页面点击"到"主进程真干活"
+      // 的通路就必须由宿主提供 —— 没有这个端点，插件里写的 runAction 永远是死代码，
+      // 页面点击只会拿到 404（表现为"按钮在、点了没反应"）。
+      //
+      // 边界：
+      //   · 只认**已加载且生效中**的插件，且它必须真的导出 runAction；
+      //   · key 只取一段（[^/]+），不允许路径穿越；
+      //   · 插件返回 { ok:false } 时回 502 —— 与插件注入脚本的约定一致（它先读 body.ok）。
+      method: 'POST', pattern: /^\/api\/skills\/([^/]+)\/action\/([^/]+)$/,
+      handler: async ({ req, res, json, match }) => {
+        const id = decodeURIComponent(match[1]);
+        const key = decodeURIComponent(match[2]);
+        const skill = skillManager.registry.get(id);
+        if (!skill) return json(res, 404, { ok: false, error: `Skill 不存在：${id}` });
+        if (typeof skill.runAction !== 'function') {
+          return json(res, 404, { ok: false, error: `这个 Skill 没有提供动作接口（未导出 runAction）：${id}` });
+        }
+        const st = skillManager.isActive(id, skillRuntimeContext());
+        if (!st.active) {
+          return json(res, 409, { ok: false, error: `Skill 未生效，动作不可用：${id}（${st.reason || st.code || '未生效'}）` });
+        }
+        const args = await bodyOf(req);
+        try {
+          const result = await skill.runAction(key, args ?? {});
+          if (result && typeof result === 'object' && result.ok === false) {
+            return json(res, 502, { ok: false, error: String(result.error || '动作执行失败') });
+          }
+          return json(res, 200, result && typeof result === 'object' ? result : { ok: true, result });
+        } catch (error) {
+          log(`[api] 动作失败 ${id}/${key}：${error?.stack ?? error?.message ?? error}`);
+          return json(res, 502, { ok: false, error: String(error?.message ?? error) });
+        }
+      }
+    },
+    {
       // 单个 Skill：切开关 / 改设置。两个动作分开处理，避免"改了设置顺手把我开着的关了"。
       method: 'POST', pattern: /^\/api\/skills\/([^/]+)$/,
       handler: async ({ req, res, json, match }) => {
@@ -1192,6 +1278,207 @@ export function createRoutes(deps) {
         const r = orchestrator.abortSession(match[1]);
         if (!r.ok) return json(res, 409, { ok: false, error: r.reason });
         return json(res, 200, { ok: true });
+      }
+    },
+    // ── 本地聊天（在软件界面里直接和 Agent 说话）──────────────────────
+    // 功能本身由核心实现，**是否存在由插件决定**：
+    // plugins/local-chat 提供 `console.chat.meta` 能力；插件没装/没开 → 这里全部 404，
+    // 界面上的「聊天」页签也拿不到 enabled，自然不出现。
+    {
+      method: 'GET', pattern: '/api/local-chat/available',
+      handler: async ({ res, json }) => {
+        const meta = localChatMeta();
+        return json(res, 200, { enabled: Boolean(meta), title: meta?.title || '聊天' });
+      }
+    },
+    {
+      method: 'GET', pattern: '/api/local-chat/messages',
+      handler: async ({ res, json, url }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用（请启用 local-chat 插件）' });
+        const limit = Math.min(500, Math.max(1, Number(url.searchParams.get('limit')) || 200));
+        const messages = store.recent(LOCAL_CHAT_KEY, { limit }).map((m) => ({
+          id: m.id, ts: m.ts, text: m.text, self: m.self === true,
+          senderName: m.senderName || '', media: m.media || []
+        }));
+        return json(res, 200, { chatKey: LOCAL_CHAT_KEY, messages });
+      }
+    },
+    {
+      method: 'POST', pattern: '/api/local-chat/send',
+      handler: async ({ req, res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用（请启用 local-chat 插件）' });
+        const body = await bodyOf(req);
+        const entry = await sendLocalMessage(body.text);
+        return json(res, 200, { ok: true, id: entry.id, ts: entry.ts });
+      }
+    },
+    // 聊天页读哪个存档的记忆：'' = 默认（主人私聊）、'none' = 一个都不读、其它 = 指定 chatKey
+    {
+      method: 'GET', pattern: '/api/local-chat/context',
+      handler: async ({ res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用（请启用 local-chat 插件）' });
+        const lc = getConfig().localChat || {};
+        const options = store.listChats()
+          .map((k) => ({ chatKey: k, ...store.getChatMeta(k) }))
+          .filter((c) => c.chatKey !== LOCAL_CHAT_KEY)
+          .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+        return json(res, 200, {
+          readArchive: String(lc.readArchive || ''),
+          readRounds: Number(lc.readRounds) || 20,
+          options
+        });
+      }
+    },
+    {
+      method: 'POST', pattern: '/api/local-chat/context',
+      handler: async ({ req, res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用（请启用 local-chat 插件）' });
+        const body = await bodyOf(req);
+        const patch = {};
+        if (typeof body.readArchive === 'string') patch.readArchive = body.readArchive.trim();
+        if (body.readRounds !== undefined) patch.readRounds = Math.max(1, Math.min(200, Number(body.readRounds) || 20));
+        updateConfig({ localChat: patch });
+        const lc = getConfig().localChat || {};
+        log(`[local-chat] 记忆来源改为 ${patch.readArchive ?? lc.readArchive ?? '(默认)'}，轮数 ${lc.readRounds ?? 20}`);
+        return json(res, 200, { ok: true, readArchive: String(lc.readArchive || ''), readRounds: Number(lc.readRounds) || 20 });
+      }
+    },
+    // 本地聊天自己的记忆（只含聊天产生的，别人存档的记忆不在这里）
+    {
+      method: 'GET', pattern: '/api/local-chat/memory',
+      handler: async ({ res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用' });
+        const mapMembers = (chatKey) => (memory.members(chatKey) || []).map((m) => ({
+          userId: m.userId,
+          name: m.name || '',
+          impressions: (m.impressions || []).map((e, i) => ({ index: i, content: e.content, createdAt: e.createdAt || 0 }))
+        }));
+
+        // 借看中的那个存档：面板要给出来（只读），否则"自己的还没攒下记忆"时整页看着是空的
+        const lc = getConfig().localChat || {};
+        const want = lc.readArchive === undefined ? 'none' : String(lc.readArchive).trim();
+        let borrowed = null;
+        if (want !== 'none') {
+          let key = want;
+          if (!key) {
+            const c0 = getConfig();
+            const qq = String(c0.skills?.autopilot?.ownerQQ || (c0.allow?.private || [])[0] || '').trim();
+            if (qq) key = `private:${qq}`;
+            if (!key || !store.listChats().includes(key)) {
+              const priv = store.listChats().filter((k) => k.startsWith('private:'));
+              key = priv.sort((a, b) => (store.getChatMeta(b).lastTs || 0) - (store.getChatMeta(a).lastTs || 0))[0] || '';
+            }
+          }
+          if (key && key !== LOCAL_CHAT_KEY) {
+            borrowed = { chatKey: key, chatName: store.getChatMeta(key)?.chatName || '', members: mapMembers(key) };
+          }
+        }
+
+        return json(res, 200, { chatKey: LOCAL_CHAT_KEY, members: mapMembers(LOCAL_CHAT_KEY), borrowed });
+      }
+    },
+    {
+      method: 'POST', pattern: '/api/local-chat/memory/delete',
+      handler: async ({ req, res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用' });
+        const body = await bodyOf(req);
+        const userId = String(body.userId ?? '').trim();
+        const indexes = (Array.isArray(body.indexes) ? body.indexes : [body.index]).map((n) => Number(n)).filter((n) => Number.isInteger(n) && n >= 0);
+        if (!userId) return json(res, 400, { error: '缺少 userId' });
+        if (!indexes.length) return json(res, 400, { error: '缺少要删的条目序号' });
+        const all = memory.members(LOCAL_CHAT_KEY) || [];
+        const member = all.find((m) => String(m.userId) === userId);
+        if (!member) return json(res, 404, { error: '没有这个成员的记忆' });
+        const keep = (member.impressions || []).filter((_, i) => !indexes.includes(i));
+        const removed = (member.impressions || []).length - keep.length;
+        memory.editMemberImpression(LOCAL_CHAT_KEY, {
+          userId: member.userId,
+          name: member.name || '',
+          impressions: keep.map((e) => ({ content: e.content, createdAt: e.createdAt }))
+        });
+        log(`[local-chat] 删掉 ${removed} 条聊天记忆（${member.name || userId}）`);
+        return json(res, 200, { ok: true, removed, left: keep.length });
+      }
+    },
+    // 聊天页：改 / 删单条消息（只对本地聊天开放）
+    {
+      method: 'POST', pattern: '/api/local-chat/message/update',
+      handler: async ({ req, res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用' });
+        const body = await bodyOf(req);
+        const id = Number(body.id);
+        const text = String(body.text ?? '');
+        if (!Number.isFinite(id)) return json(res, 400, { error: '缺少消息 id' });
+        if (!text.trim()) return json(res, 400, { error: '内容不能为空（要删就用删除）' });
+        if (text.length > 4000) return json(res, 400, { error: '太长了（上限 4000 字）' });
+        const ok = store.updateByLocalId(LOCAL_CHAT_KEY, id, { text });
+        if (!ok) return json(res, 404, { error: '找不到这条消息' });
+        emit('chat-update', LOCAL_CHAT_KEY);
+        // 改完立刻重建记忆，别让它"记得"旧版本
+        const memoryRebuild = await rebuildLocalMemory();
+        return json(res, 200, { ok: true, id, text, memory: memoryRebuild });
+      }
+    },
+    {
+      method: 'POST', pattern: '/api/local-chat/message/delete',
+      handler: async ({ req, res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用' });
+        const body = await bodyOf(req);
+        const id = Number(body.id);
+        if (!Number.isFinite(id)) return json(res, 400, { error: '缺少消息 id' });
+        const removed = store.removeByLocalIds(LOCAL_CHAT_KEY, [id]);
+        if (!removed) return json(res, 404, { error: '找不到这条消息' });
+        emit('chat-update', LOCAL_CHAT_KEY);
+        // 删完重建：被删掉的话不该继续留在记忆块里
+        const memoryRebuild = await rebuildLocalMemory();
+        return json(res, 200, { ok: true, removed, memory: memoryRebuild });
+      }
+    },
+    // 记忆重建：删/改消息后重新归纳这个会话的小时块（B 方案）
+    // 归纳是纯机械拼接（who: text），不调模型，所以可以随手重建。
+    {
+      method: 'POST', pattern: '/api/local-chat/memory/rebuild',
+      handler: async ({ req, res, json }) => {
+        if (!localChatMeta()) return json(res, 404, { error: '本地聊天未启用' });
+        const r = await rebuildLocalMemory();
+        return json(res, 200, { ok: r.ok, ...r });
+      }
+    },
+    // ── 存档导出 / 导入（供「聊天记录发布」插件调用）────────────────────
+    {
+      method: 'GET', pattern: '/api/archives',
+      handler: async ({ res, json }) => {
+        const archives = store.listChats()
+          .map((k) => ({ chatKey: k, ...store.getChatMeta(k) }))
+          .sort((a, b) => (b.lastTs || 0) - (a.lastTs || 0));
+        return json(res, 200, { archives });
+      }
+    },
+    {
+      method: 'GET', pattern: '/api/archives/export',
+      handler: async ({ res, json, url }) => {
+        const chatKey = String(url.searchParams.get('chatKey') || '').trim();
+        if (!chatKey) return json(res, 400, { error: '缺少 chatKey' });
+        const data = store.exportAll(chatKey);
+        return json(res, 200, { ...data, exportedAt: Date.now() });
+      }
+    },
+    {
+      method: 'POST', pattern: '/api/archives/import',
+      handler: async ({ req, res, json }) => {
+        const body = await bodyOf(req);
+        const chatKey = String(body.chatKey || '').trim();
+        if (!chatKey) return json(res, 400, { error: '缺少 chatKey' });
+        // 只允许三种合法会话 key，防止被拿去写任意文件/覆盖奇怪的东西
+        if (!/^(private|group|local):[0-9A-Za-z_-]{1,48}$/.test(chatKey)) {
+          return json(res, 400, { error: `chatKey 不合法：${chatKey}` });
+        }
+        if (!Array.isArray(body.messages)) return json(res, 400, { error: 'messages 必须是数组' });
+        if (body.messages.length > 20000) return json(res, 400, { error: '消息太多（上限 20000 条）' });
+        const count = store.importAll(chatKey, body.messages);
+        emit('chat-update', chatKey);
+        log(`[archive] 已用远端数据覆盖 ${chatKey}（${count} 条）`);
+        return json(res, 200, { ok: true, chatKey, count });
       }
     },
     {

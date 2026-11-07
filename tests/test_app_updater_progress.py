@@ -242,7 +242,10 @@ class DownloadProgressTests(unittest.TestCase):
         self.assertIsNone(snapshot["percent"])
 
     def test_legacy_call_without_progress_still_works(self):
-        result = _download(_info(), self._client([EXE_BYTES]), self.root)
+        # 这条测的是"不传 progress 也能下载"，不是校验政策：没有发布方哈希时
+        # download_update 现在默认拒绝，所以这里显式放行未校验，才走得到下载路径。
+        result = _download(_info(), self._client([EXE_BYTES]), self.root,
+                           allow_unverified=True)
         self.assertEqual(result["sha256"], EXE_SHA)
         self.assertFalse(result["verified"])
         self.assertEqual(result["verifyStatus"], app_updater.VERIFY_UNKNOWN)
@@ -314,7 +317,8 @@ class IntegrityTests(unittest.TestCase):
     def test_empty_download_is_rejected(self):
         client = _FakeClient({EXE_URL: _StreamResponse([], url=EXE_URL, headers={})})
         with self.assertRaises(ValueError) as caught:
-            _download(_info(), client, self.root)
+            # 放行未校验，才轮得到"下载到空包"这条判定先报错。
+            _download(_info(), client, self.root, allow_unverified=True)
         self.assertIn("空", str(caught.exception))
         self.assertEqual(list(self.root.iterdir()), [])
 
@@ -323,7 +327,7 @@ class IntegrityTests(unittest.TestCase):
             [EXE_BYTES], url=EXE_URL,
             headers={"content-length": str(app_updater.MAX_UPDATE_BYTES + 1)})})
         with self.assertRaises(ValueError) as caught:
-            _download(_info(), client, self.root)
+            _download(_info(), client, self.root, allow_unverified=True)
         self.assertIn("300 MB", str(caught.exception))
         self.assertEqual(list(self.root.iterdir()), [])
 
@@ -332,7 +336,7 @@ class IntegrityTests(unittest.TestCase):
             [EXE_BYTES], url="https://evil.example/payload.exe",
             headers={"content-length": str(len(EXE_BYTES))})})
         with self.assertRaises(ValueError) as caught:
-            _download(_info(), client, self.root)
+            _download(_info(), client, self.root, allow_unverified=True)
         self.assertIn("非 GitHub", str(caught.exception))
         self.assertEqual(list(self.root.iterdir()), [])
 
@@ -349,7 +353,7 @@ class AssetNameTests(unittest.TestCase):
         evil = "..\\..\\evil.exe"
         client = _FakeClient({EXE_URL: _StreamResponse(
             [EXE_BYTES], url=EXE_URL, headers={"content-length": str(len(EXE_BYTES))})})
-        result = _download(_info(name=evil), client, self.root)
+        result = _download(_info(name=evil), client, self.root, allow_unverified=True)
         target = Path(result["path"]).resolve()
         self.assertEqual(target.parent, self.root.resolve())
         self.assertNotIn("..", result["name"])

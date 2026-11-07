@@ -34,6 +34,7 @@ import os
 import re
 import threading
 import time
+import uuid
 from pathlib import Path
 
 MAX_LESSONS = 200
@@ -87,10 +88,40 @@ def clean_actions(actions) -> list[dict]:
     return result
 
 
+_LOCKS: dict[str, threading.RLock] = {}
+_LOCKS_GUARD = threading.Lock()
+_PERSONA_BAD = re.compile(r'[^0-9A-Za-z_\-\u4e00-\u9fff]+')
+
+
+def _file_lock(path) -> threading.RLock:
+    """同一路径的所有实例共用一把锁：进程内先串行，再谈原子替换。"""
+    key = os.path.normcase(str(Path(path).resolve()))
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = _LOCKS[key] = threading.RLock()
+        return lock
+
+
+def persona_file(path, persona=''):
+    """人格 → 学习库文件；默认人格仍是原路径，老文件和老读法都不用动。"""
+    base = Path(path)
+    persona = str(persona or '').strip()[:40]
+    if not persona:
+        return base
+    slug = _PERSONA_BAD.sub('_', persona)
+    if not slug or slug != persona:
+        slug = '%s-%s' % (slug[:20], hashlib.sha256(persona.encode('utf-8')).hexdigest()[:8])
+    return base.with_name('%s.%s%s' % (base.stem, slug, base.suffix or '.json'))
+
+
 class AgentLearning:
-    def __init__(self, path):
-        self.path = Path(path)
-        self._lock = threading.RLock()
+    def __init__(self, path, persona=''):
+        self.base_path = Path(path)
+        self.persona = str(persona or '').strip()[:40]
+        self.path = persona_file(self.base_path, self.persona)
+        self._lock = _file_lock(self.path)
+        self._stamp = None
         self._state = {'version': 1, 'preferences': {}, 'lessons': [], 'skills': []}
         self.load()
 
@@ -98,11 +129,12 @@ class AgentLearning:
 
     def load(self):
         with self._lock:
+            state = {'version': 1, 'preferences': {}, 'lessons': [], 'skills': []}
             try:
                 if self.path.is_file() and self.path.stat().st_size <= MAX_BYTES:
                     data = json.loads(self.path.read_text(encoding='utf-8'))
                     if isinstance(data, dict):
-                        self._state = {
+                        state = {
                             'version': 1,
                             'preferences': data.get('preferences') if isinstance(data.get('preferences'), dict) else {},
                             'lessons': data.get('lessons') if isinstance(data.get('lessons'), list) else [],
@@ -110,20 +142,61 @@ class AgentLearning:
                         }
             except (OSError, ValueError, RecursionError):
                 # 学习库坏了不能拖垮控制台：保留空库，下次写入覆盖。
-                self._state = {'version': 1, 'preferences': {}, 'lessons': [], 'skills': []}
+                pass
+            self._state = state
             self._trim()
+            self._stamp = self._stamp_of()
+
+    def _stamp_of(self):
+        try:
+            info = self.path.stat()
+        except OSError:
+            return None
+        return (info.st_mtime_ns, info.st_size)
+
+    def _refresh(self):
+        """别的实例或进程先写过就重读磁盘，避免拿旧内存状态覆盖别人的记录。"""
+        if self._stamp_of() != self._stamp:
+            self.load()
 
     def save(self):
         with self._lock:
             self._trim()
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            temp = self.path.with_suffix('.tmp')
-            temp.write_text(json.dumps(self._state, ensure_ascii=False, indent=1), encoding='utf-8')
-            os.replace(temp, self.path)
+            # 临时文件名带 pid 和随机串：多进程同时写同一人格也不会互相踩临时文件。
+            temp = self.path.with_name('%s.%s.%s.tmp' % (self.path.stem, os.getpid(), uuid.uuid4().hex[:8]))
+            try:
+                temp.write_text(json.dumps(self._state, ensure_ascii=False, indent=1), encoding='utf-8')
+                os.replace(temp, self.path)
+            finally:
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+            self._stamp = self._stamp_of()
 
     def _trim(self):
-        self._state['lessons'] = self._state['lessons'][-MAX_LESSONS:]
-        self._state['skills'] = self._state['skills'][-MAX_SKILLS:]
+        # 按价值裁，不按插入顺序裁：以前是 lessons[-200:]，攒满 200 条以后
+        # 再学到新东西，丢的永远是**最早**那条 —— 而最早那条往往是最早教会
+        # 机器人怎么干活的经验。改成先按成功次数减失败次数排，同分再比新鲜度；
+        # 实在打平才回落到原来的先后顺序（dict 稳定排序，插入序）。
+        lessons = self._state['lessons']
+        if len(lessons) > MAX_LESSONS:
+            def _value(item):
+                ok = int(item.get('ok') or 0)
+                fail = int(item.get('fail') or 0)
+                return (ok - fail, float(item.get('updated') or 0))
+            keep = sorted(lessons, key=_value)[-MAX_LESSONS:]
+            # sorted 稳定，同分项保持原有先后；这里不再二次排序，避免把新经验挤到末尾。
+            self._state['lessons'] = keep
+        skills = self._state['skills']
+        if len(skills) > MAX_SKILLS:
+            # 技能同理按价值裁：关掉过的技能是用户明确说「别用」的，先丢它们；
+            # 同档再按导入时间，新的留。以前按插入序裁，用户关掉的旧技能反而比
+            # 新导入但没关的更「长寿」。
+            def _skill_value(item):
+                return (1 if item.get('enabled', True) else 0, float(item.get('imported') or 0))
+            self._state['skills'] = sorted(skills, key=_skill_value)[-MAX_SKILLS:]
         prefs = self._state['preferences']
         if len(prefs) > MAX_PREFERENCES:
             keep = sorted(prefs.items(), key=lambda kv: float((kv[1] or {}).get('updated') or 0))[-MAX_PREFERENCES:]
@@ -137,6 +210,7 @@ class AgentLearning:
         if not key or not value:
             raise ValueError('偏好需要有名称和内容')
         with self._lock:
+            self._refresh()
             self._state['preferences'][key] = {'value': value, 'note': str(note or '')[:200],
                                                'updated': time.time()}
             self.save()
@@ -147,6 +221,7 @@ class AgentLearning:
 
     def forget_preference(self, key):
         with self._lock:
+            self._refresh()
             existed = self._state['preferences'].pop(str(key or ''), None)
             self.save()
         return bool(existed)
@@ -164,6 +239,7 @@ class AgentLearning:
         fingerprint = self._fingerprint(actions)
         now = time.time()
         with self._lock:
+            self._refresh()
             for lesson in self._lessons():
                 if lesson.get('actions') and self._fingerprint(lesson['actions']) == fingerprint \
                         and similarity(lesson.get('intent', ''), intent) >= .8:
@@ -193,6 +269,7 @@ class AgentLearning:
             raise ValueError('学习摘要不能为空')
         now = time.time()
         with self._lock:
+            self._refresh()
             lesson = {'id': uuid_like(source + summary + str(now)), 'intent': summary,
                       'bigrams': bigrams(summary)[:60], 'actions': [], 'summary': summary,
                       'ok': 0, 'fail': 0, 'note': str(detail or '')[:300],
@@ -211,6 +288,7 @@ class AgentLearning:
         if score not in (-1, 1):
             raise ValueError('反馈分数只能是 1 或 -1')
         with self._lock:
+            self._refresh()
             target = None
             if lesson_id:
                 target = next((l for l in self._lessons() if l.get('id') == lesson_id), None)
@@ -231,6 +309,7 @@ class AgentLearning:
 
     def forget_lesson(self, identifier):
         with self._lock:
+            self._refresh()
             before = len(self._lessons())
             self._state['lessons'] = [l for l in self._lessons() if l.get('id') != identifier]
             self.save()
@@ -238,6 +317,9 @@ class AgentLearning:
 
     def match_lessons(self, text, limit=4):
         """按相似度取历史经验；失败多的降权，但保留可解释性。"""
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
         scored = []
         for lesson in self._lessons():
             score = similarity(text, lesson.get('intent', ''))
@@ -252,13 +334,19 @@ class AgentLearning:
             scored.append((ranked, score, lesson))
         scored.sort(key=lambda item: item[0], reverse=True)
         result = []
-        for ranked, score, lesson in scored[:max(0, int(limit))]:
+        for ranked, score, lesson in scored:
+            # 先按相似度阈值筛，再取前 limit 条。反过来写（先切片后筛）会漏经验：
+            # ranked = score × 置信度系数 × 新鲜度系数，两个系数都小于 1，所以
+            # 「相似度高但反复失败」的经验 ranked 可能低于「相似度一般但从没失败」的，
+            # 排在前 limit 之外；前 limit 条若都被阈值筛掉，明明还有合格经验却返回空。
             if score < .28:
                 continue
             result.append({'id': lesson.get('id'), 'intent': lesson.get('intent'),
                            'summary': lesson.get('summary'), 'actions': lesson.get('actions'),
                            'ok': lesson.get('ok', 0), 'fail': lesson.get('fail', 0),
                            'score': round(score, 2)})
+            if len(result) >= limit:
+                break
         return result
 
     # ---------- 维护 ----------
@@ -268,6 +356,7 @@ class AgentLearning:
         now = time.time() if now is None else float(now)
         removed_failed = removed_stale = 0
         with self._lock:
+            self._refresh()
             kept = []
             for lesson in self._lessons():
                 ok = int(lesson.get('ok') or 0)
@@ -331,6 +420,7 @@ class AgentLearning:
         if type(enabled) is not bool:
             raise ValueError('启用状态必须是布尔值')
         with self._lock:
+            self._refresh()
             skill = next((s for s in self._state['skills'] if s.get('id') == identifier), None)
             if skill is None:
                 raise ValueError('技能不存在')
@@ -342,6 +432,7 @@ class AgentLearning:
         """导入技能包（纯数据，不执行）。返回写入后的技能记录。"""
         record = self._skill_record(package, source)
         with self._lock:
+            self._refresh()
             old = next((s for s in self._state['skills'] if s.get('id') == record['id']), None)
             if old is not None:
                 record['enabled'] = bool(old.get('enabled', True))
@@ -353,6 +444,7 @@ class AgentLearning:
 
     def forget_skill(self, identifier):
         with self._lock:
+            self._refresh()
             before = len(self._state['skills'])
             self._state['skills'] = [s for s in self._state['skills'] if s.get('id') != identifier]
             self.save()
@@ -380,7 +472,7 @@ class AgentLearning:
             return {'lessons': len(lessons), 'skills': len(self._state['skills']),
                     'preferences': len(self._state['preferences']),
                     'success': ok, 'failure': fail,
-                    'path': str(self.path)}
+                    'path': str(self.path), 'persona': self.persona}
 
     def overview(self, limit=50):
         with self._lock:

@@ -268,25 +268,33 @@ def persona_key(prompt):
 
 def turn_text(message):
     from .image_input import message_text
+    # message.speaker-format：扩展给了标签就用它，没给（空串）走原来的拼法。
+    # 宿主 prompt.js 的契约是"返回整段标签文本"，空串表示"我不表态"，所以这里
+    # 只做覆盖、不做拼接 —— 混着拼会得到「〔主人〕名字(QQ:123)：名字(QQ:123)」。
+    label = str(message.get('_speaker_label') or '').strip()
     # 戳一戳/贴表情这类通知没有正文：给一句明确的"发生了什么"，
     # 否则模型看到的是一条空 user 轮次，只能去接上一条话题（真机踩过：
     # 群里戳了机器人，它却对着上一个人刚说的挑衅回嘴）。
     if message.get('notice') == 'poke':
         details = message.get('notice_data') if isinstance(message.get('notice_data'), dict) else {}
         poker = str(details.get('poker') or message.get('sender_id') or '').strip()
-        who = str(message.get('sender_name') or '').strip() or (f'QQ:{poker[:8]}' if poker else '对方')
+        who = label or str(message.get('sender_name') or '').strip() or (f'QQ:{poker[:8]}' if poker else '对方')
         base = f'（{who} 戳了戳你：这是 QQ 戳一戳动作，没有文字或图片内容）'
         if message.get('kind') == 'group':
+            if label:
+                return label + '\n' + base
             identity = {'sender_id': person_of(message), 'name': who}
             return ('发送者资料（仅用于区分说话的人）：'
                     + json.dumps(identity, ensure_ascii=False) + '\n' + base)
         return base
     if message.get('_soft_poke'):
         # 官方模式没有 poke 事件：把"@ 了机器人但一个字没说"当作戳一戳。
-        who = str(message.get('sender_name') or '').strip() or '对方'
+        who = label or str(message.get('sender_name') or '').strip() or '对方'
         base = (f'（{who} 只 @ 了你一下，没有说任何文字或图片，像是在戳了戳你：'
                 '这是 QQ 官方接口下的"戳一下"信号）')
         if message.get('kind') == 'group':
+            if label:
+                return label + '\n' + base
             identity = {'sender_id': person_of(message), 'name': who}
             return ('发送者资料（仅用于区分说话的人）：'
                     + json.dumps(identity, ensure_ascii=False) + '\n' + base)
@@ -295,8 +303,11 @@ def turn_text(message):
     if message.get('forward_description'):
         text += '\n' + quoted_context('当时读取的转发文本',message['forward_description'])['content']
     if message.get('kind') == 'group':
-        identity = {'sender_id':person_of(message),'name':str(message.get('sender_name') or message.get('sender') or '')[:80]}
-        text = '发送者资料（仅用于区分说话的人）：'+json.dumps(identity,ensure_ascii=False)+'\n'+text
+        if label:
+            text = label + '\n' + text
+        else:
+            identity = {'sender_id':person_of(message),'name':str(message.get('sender_name') or message.get('sender') or '')[:80]}
+            text = '发送者资料（仅用于区分说话的人）：'+json.dumps(identity,ensure_ascii=False)+'\n'+text
     return text
 
 

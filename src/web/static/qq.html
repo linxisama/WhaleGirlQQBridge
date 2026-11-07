@@ -29,6 +29,8 @@ button:disabled{opacity:.5;cursor:wait}
 .tab-btn{background:none;border:0;border-bottom:3px solid transparent;color:#7a94b0;padding:10px 18px;font:inherit;font-size:14px;cursor:pointer;border-radius:0}
 .tab-btn.active{color:#58d5c5;border-bottom-color:#58d5c5}
 .tab-panel{display:none}.tab-panel.active{display:block}
+/* Heart panel */
+.heart-frame{display:block;width:100%;height:calc(100vh - 300px);min-height:620px;border:1px solid #273750;border-radius:12px;background:#0b1220}
 /* Plugin list */
 .plugin-row{display:flex;align-items:center;gap:14px;padding:14px 0;border-bottom:1px solid #1e2d3f}
 .plugin-row:last-child{border-bottom:0}
@@ -105,6 +107,7 @@ button:disabled{opacity:.5;cursor:wait}
     <button class="tab-btn" onclick="switchTab('persona')">🐋 人格</button>
     <button class="tab-btn" onclick="switchTab('messages')">💬 消息</button>
     <button class="tab-btn" onclick="switchTab('logs')">📋 日志</button>
+    <button class="tab-btn" data-tab="heart" onclick="switchTab('heart')">🫀 心情</button>
   </div>
 
   <!-- Settings Tab -->
@@ -155,6 +158,7 @@ button:disabled{opacity:.5;cursor:wait}
     <div class="card">
       <h2>🧩 触发节奏插件</h2>
       <p>控制机器人何时回复、怎么回复的行为插件。所有设置实时保存，无需重启。</p>
+      <p>🫀 <button class="secondary" onclick="switchTab('heart')">打开心情面板</button> —— 14 项情绪数值、模式开关、睡眠闸门与五维滑杆（由 dsh-heart-qq 插件提供，也可<a href="/heart" target="_blank" rel="noopener">在新标签页打开</a>）。</p>
       <div id="plugin-list"><p style="color:#7a94b0">加载插件中…</p></div>
     </div>
   </div>
@@ -213,6 +217,20 @@ button:disabled{opacity:.5;cursor:wait}
       <div class="log-list">
         <div class="log-head"><span>时间</span><span>级别</span><span>来源</span><span>摘要</span></div>
         <div id="log-list"><p class="hint" style="padding:12px">暂无日志。</p></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Heart Tab -->
+  <div id="tab-heart" class="tab-panel">
+    <div class="card">
+      <h2>🫀 心情系统</h2>
+      <p>14 项情绪数值、模式开关、睡眠闸门与五维滑杆。面板由 dsh-heart-qq 插件提供，改完立刻生效。</p>
+      <p class="hint">这里空白说明插件没加载，或插件设置里「网页面板」关着 —— 到「插件」页检查。</p>
+      <iframe id="heart-frame" class="heart-frame" title="心情面板" src="about:blank"></iframe>
+      <div class="row" style="margin-top:12px">
+        <button id="heart-reload" class="secondary">↻ 重新加载面板</button>
+        <a href="/heart" target="_blank" rel="noopener" style="align-self:center">在新标签页打开</a>
       </div>
     </div>
   </div>

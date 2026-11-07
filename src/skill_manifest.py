@@ -114,11 +114,23 @@ def _close(reader):
 
 
 def _package_root(names):
-    """包根 = 最浅的 skill.json / plugin.json 所在目录（无清单返回 None）。"""
+    """包根 = 最浅的「既有清单、又有入口」的目录；都没有入口时退回最浅清单目录。
+
+    市场里有一批包是双层嵌套（真例 <id>/<id>/index.js）：外层只放了
+    skill.json / plugin.json 副本，真包在内层。按「最浅清单目录」取根会把
+    entry 拼成 <id>/index.js 而文件根本不存在，整包被判 no-entry。
+    """
     manifests = [name for name in names if posixpath.basename(name) in MANIFEST_NAMES]
     if not manifests:
         return None
-    return posixpath.dirname(min(manifests, key=lambda name: name.count("/")))
+    name_set = set(names)
+    dirs = sorted({posixpath.dirname(name) for name in manifests},
+                  key=lambda item: (item.count("/") if item else -1, item))
+    for root in dirs:
+        for entry in ENTRY_NAMES:
+            if (posixpath.join(root, entry) if root else entry) in name_set:
+                return root
+    return dirs[0]
 
 
 def _package_entry(root, names):
@@ -247,7 +259,7 @@ def _tool_entries(tools, skill_id):
     return entries
 
 
-def classify(reader, tools=None):
+def classify(reader, tools=None, skill_id=""):
     """对**一个** skill 包做静态分层。
 
     返回 {tier, tierReason, tools, usage, requires, hostImports, permissions, external, entry, root}。
@@ -294,7 +306,7 @@ def classify(reader, tools=None):
     closure = list(scan.get("files") or ([entry] if entry else []))
     usage = _ctx_usage(reader, closure)
     external = _external_hosts(reader, name_set)
-    tool_list = _tool_entries(tools, posixpath.basename(root) if root else "")
+    tool_list = _tool_entries(tools, skill_id or (posixpath.basename(root) if root else ""))
 
     def result(tier, reason):
         return {
@@ -317,16 +329,64 @@ def classify(reader, tools=None):
     if missing:
         return result("T6-disabled", "load-failed:%s" % sorted(set(missing))[0])
     if register_sites == 0 and not tool_list:
-        return result("T6-disabled", "no-tools")
+        # 有一类包天生没有工具、但必须注册才生效（纯提示词 / 纯 hook / 纯 provider）：
+        #   · force-send   —— 功能全在 skill.json 的 prompt.sections，
+        #                    宿主 getPromptSections()（src/skills/manager.js:440）
+        #                    遍历**已注册** skill 时才读得到；
+        #   · topic-guard  —— 只导出 hooks，靠 on_before_tool 硬拦；
+        #   · video-frames —— 只导出 providers，给核心提供 video.frames；
+        #   · account-pool —— 只导出 providers，提供 llm.endpoint-pick 等。
+        # 它们都没有工具，原判「无工具就不注册」把整类包判成结构性残缺。
+        _side = False
+        _decl2 = declaration if isinstance(declaration, dict) else {}
+        _prompt = _decl2.get("prompt") if isinstance(_decl2.get("prompt"), dict) else {}
+        if _prompt.get("sections"):
+            _side = True
+        if not _side:
+            for _n in names:
+                if not _n.endswith(JS_EXTS):
+                    continue
+                _t = _read(reader, _n)
+                if not _t:
+                    continue
+                _c = _strip_comments(_t)
+                if any(_tok in _c for _tok in (
+                        "export function hooks", "export const hooks",
+                        "export function providers", "export const providers",
+                        "export function promptSections", "export const promptSections",
+                        "hooks:", "providers:")):
+                    _side = True
+                    break
+        if not _side:
+            return result("T6-disabled", "no-tools")
     if escape_above:
         return result("T6-disabled", "escape-run-root:%s" % sorted(set(escape_above))[0])
     if host_imports:
-        return result("T4-host-source", "host-source:%s" % sorted(set(host_imports))[0])
+        # 这里故意保持不可达（条件用的是上一行已判成 T6 的 escape_above），别顺手改成
+        # `if host_imports: return T4`。实测依据（2026-11-07 17:0x，.tmp/t4_impact.py）：
+        # 拿 host_imports 直接判 T4 会让 data/qq-only/skill_extensions/ 里 373 个真实包
+        # 中的 85 个从 T1/T2 翻成 T4-host-source，而 BLOCKED_TIERS 对 T4 是「不加载、
+        # 不重试」⇒ 85 个包当场全部不再注册（bili / machine-work / acmbot / deep-think
+        # / academic-assistant 都在里面）。根因是 2 层上溯并不算不可用：宿主把包拷到
+        # <source>/skills-host-<pid>/0000-<id>/（runtime/qqagent-host/host-one.mjs:204），
+        # 从包根上溯 2 层正好回到 <source>/，`../../src/config.js` 实测能 import。
+        # 真正的加载失败（入口自己上溯 >=3 层）由上面的 escape_above 判成 T6。
+        _above = sorted(set(escape_above))
+        if _above:
+            return result("T4-host-source", "host-source:%s" % _above[0])
+    if host_imports:
+        _above = sorted(set(escape_above))
+        if _above:
+            return result("T4-host-source", "host-source:%s" % _above[0])
     if requires:
         return result("T5-depends-other", "requires:%s" % requires[0])
-    extra = sorted(set(permissions) & EXTRA_APIS)
-    if extra:
-        return result("T3-extra-api", "extra-api:%s" % extra[0])
+    # onebot / qq_sticker 曾被视为「宿主没开放的额外 API」，实测宿主本来就给：
+    #   ctx.onebot  —— runtime/qqagent-host/src/orchestrator.js:958 `onebot: this.onebot`
+    #   ctx.stickers —— orchestrator.js:961 `stickers: this.stickers`
+    # 工具执行时 ctx 由 tools.js:131-134 的注释明确列出（onebot, store, memory, stickers,
+    # sender, session 都在里面）。self-profile 实测 list_tools ok + set_profile 能跑
+    # （只因为测试时没有 QQ 上下文才回「拿不到请求者 QQ 号」）。
+    # 所以这两个权限不再降级到 T3；真需要额外 API 的包另说。
     if "web_fetch" in permissions:
         return result("T2-web-fetch", "permission:web_fetch")
     if external:
@@ -415,7 +475,7 @@ def _skill_entry(skill_id, path, kind):
     tools = _extract_tools_for(path)
     reader = _reader_for(path)
     try:
-        info = classify(reader, tools=tools)
+        info = classify(reader, tools=tools, skill_id=skill_id)
     finally:
         _close(reader)
     declaration = _manifest_decl(reader, info["root"]) if info["root"] is not None else {}
@@ -596,6 +656,16 @@ def ensure_manifest(runtime=None, ttl=86400, force=False, market_dir=None, exten
                     "stamp": stamp(target),
                     "counts": (data.get("stats") or {}).get("tierCounts"),
                 }
+        if extensions_root is None:
+            try:
+                extensions_root = skill_tools.extensions_dir(runtime)
+            except Exception:
+                extensions_root = None
+        if market_dir is None:
+            try:
+                market_dir = skill_tools.market_dir(runtime=runtime)
+            except Exception:
+                market_dir = None
         manifest = build_manifest(market_dir=market_dir, extensions_root=extensions_root)
         if not manifest.get("skills"):
             # 扫不到任何 skill 时绝不覆盖旧清单：宁可 continue 用旧的，也不写空清单

@@ -4,7 +4,7 @@
 ----------------------------------
 1. provider：0.4 宿主里 mod.providers[name](payload)，例如 message.owner-check、
    llm.request-params、reply.local-policy。桥把它们挂到 on_prepare / on_pre_ai /
-   on_post_reply。
+   on_post_reply，另有 5 个走各自的专用消费点（见下面「provider 白名单」）。
 2. hook：0.4 宿主里的 mod.hooks[name](payload)，例如 before-context、
    before-llm-messages、after-response、before-tool、after-tool、onMessage。
    映射表见 HOOK_EVENT（与市场 hooks-map.json 一致）。
@@ -43,11 +43,34 @@ block/arguments 真正生效）。只返回 undefined 且没改 payload 的扩�
   自带工具（list_stickers 等）不会出现在 list_tools() 里；配置 toolAllowlist
   之后只有列出的工具可调用。
 
+provider 白名单（12 个）
+------------------------
+`ALLOWED_PROVIDERS` 里 7 个是原有能力，走 on_prepare / on_pre_ai / on_post_reply 的
+通用钩子；另外 5 个是宿主 0.4 真的会去问、契约又只是「JSON 进 → JSON 出」的能力，
+各有专用消费点：
+
+| provider                 | 消费点                        | 宿主调用点              |
+|--------------------------|-------------------------------|-------------------------|
+| tool.guard               | on_before_tool → tool_guard() | tool-registry.js:198    |
+| media.download           | media_download()              | app.js:1000             |
+| message.speaker-format   | speaker_format()              | prompt.js:305           |
+| llm.endpoint-pick        | endpoint_pick()               | llm.js:279              |
+| llm.endpoint-feedback    | endpoint_feedback()           | llm.js:499              |
+
+五个消费点一律 fail-open：扩展缺失、报错、超时都当作"没意见"，主回复链不因此
+报错。这是与宿主行为对齐的选择 —— 宿主那边这些调用点也在 try/catch 里。
+
 显式缺口（不伪造）
 ------------------
 0.4 会把 store / memory / session 这类真实运行时对象传进 hook 和 provider，桥这边
 没有等价物，一律传 None 并在下面 GAP_FIELDS 里注明；扩展若直接使用它们会抛错，
 桥记录为该次调用失败，而不是塞假对象让日志"看起来跑通"。
+
+media.download 的 sender/onebot 同理：宿主传的是活对象（SendQueue + 客户端），
+桥只能走 argv 的 JSON，函数序列化不过去，所以 sender 恒 None、onebot 只给
+selfId/selfNickname 两个标量。扩展里 `if (sender?.sendMedia)` 会走降级分支：
+照常下载、把 filePath 放进返回值，不发送。真发由 Python 侧 `QQRuntime._deliver_media`
+用 runtime 的发送通道完成（限频/去重/留档都在那条链路上）。
 """
 from __future__ import annotations
 
@@ -65,9 +88,20 @@ from src.plugins import PluginBase, PluginMeta, FieldSchema
 # 默认白名单；不在表里的 provider/hook 直接跳过，避免配置写错就执行任意能力。
 ALLOWED_PROVIDERS = {'message.owner-check', 'message.privilege-check', 'message.gate',
                      'reply.local-policy', 'llm.request-params', 'chat.ban-state',
-                     'message.identity'}
+                     'message.identity',
+                     # 第二轮扩张：这 5 个都是宿主 0.4 真的会去问、契约又只是
+                     # 「JSON 进 → JSON 出」的纯函数能力，桥能原样喂进去。
+                     # 市场里声明它们的扩展共 41 个（tool.guard 20 / media.download 12 /
+                     # llm.endpoint-pick 4 / message.speaker-format 3 / llm.endpoint-feedback 2）。
+                     'tool.guard', 'media.download', 'llm.endpoint-pick',
+                     'llm.endpoint-feedback', 'message.speaker-format'}
 ALLOWED_HOOKS = {'before-context', 'before-llm-messages', 'onMessage', 'after-response',
                  'before-tool', 'after-tool'}
+
+# 自动选择上限的硬顶。宿主一次调用就是一个独立 node 进程（冷启动约 1.4s，热调用
+# 55~75ms），所以「每轮调用几个扩展」直接等于每轮延迟；32 是 8 的四倍名额，
+# 但真跑满时一轮要多花约 2 秒 —— 默认值仍是 2，调大由用户自己权衡。
+MAX_PROFILES_LIMIT = 32
 
 # 宿主根（兼容宿主）判定与源码扫描上限，供 _host_root / scan_extension_dirs 早期使用。
 HOST_ROOT_MARKERS = ('src/config.js', 'src/plugin-loader.js')
@@ -82,13 +116,28 @@ EVENT_BY_PROVIDER = {
     'message.identity': 'on_prepare',
     'llm.request-params': 'on_pre_ai',
     'reply.local-policy': 'on_post_reply',
+    # 新增 5 个：事件只决定「挂在哪个 Python 钩子上」，不决定载荷形状 ——
+    # 这 5 个都走各自的专用消费点（见 QqAgentBridge 的 tool_guard / media_download /
+    # endpoint_pick / endpoint_feedback / speaker_format），on_prepare / on_pre_ai 只是
+    # 让 _event_profiles 能挑到它们，避免被"没有可执行 provider"判成不可用。
+    'tool.guard': 'on_before_tool',
+    'media.download': 'on_prepare',
+    'llm.endpoint-pick': 'on_pre_ai',
+    'llm.endpoint-feedback': 'on_pre_ai',
+    'message.speaker-format': 'on_prepare',
 }
 
 # 这三个 provider 在 0.4 文档的"被核心消费的能力名"里查不到调用方，市场里却有扩展
 # 声明它们 —— 历史上一度被当成"宿主永不调用"的死能力。本仓库给它们接了自己的消费点
 # （src/qq_app.py 的回复门禁、主人提权、机器人身份），所以这里改成"宿主会消费"：
 # bridge_status() 用这个集合把三项从 deadInHost 里摘掉，控制台不再报"宿主不支持"。
-HOST_CONSUMED_PROVIDERS = {'message.gate', 'message.privilege-check', 'message.identity'}
+HOST_CONSUMED_PROVIDERS = {'message.gate', 'message.privilege-check', 'message.identity',
+                           # 第二轮扩张的 5 个：宿主 0.4 真有调用点（tool-registry.js 的
+                           # tool.guard、app.js 的 media.download、llm.js 的 endpoint-pick /
+                           # endpoint-feedback、prompt.js 的 speaker-format），本仓库又各补了
+                           # 一个消费点，所以它们也不是"宿主不支持"。
+                           'tool.guard', 'media.download', 'llm.endpoint-pick',
+                           'llm.endpoint-feedback', 'message.speaker-format'}
 
 PROVIDER_PRIORITY = {
     'message.owner-check': 0,
@@ -98,6 +147,13 @@ PROVIDER_PRIORITY = {
     'message.identity': 4,
     'llm.request-params': 5,
     'reply.local-policy': 6,
+    # 新增能力排在既有 7 个之后：自动模式按优先级挑扩展时，先保证原有能力的
+    # 派发顺序与名额完全不变，新增的只在还有余量时补位。
+    'tool.guard': 7,
+    'media.download': 8,
+    'message.speaker-format': 9,
+    'llm.endpoint-pick': 10,
+    'llm.endpoint-feedback': 11,
 }
 
 # hook 名 → Python 事件名；与市场 hooks-map.json 的 hooks 表逐条对齐。
@@ -206,7 +262,7 @@ def catalog_profiles(catalog_path, extensions_dir='', limit=2) -> list:
                            PROVIDER_PRIORITY.get(providers[0], 99),
                            len(item.get('tools') or []), providers[0], extension, item))
     candidates.sort(key=lambda row: (row[0], row[1], row[2], str(row[5].get('id') or '')))
-    cap = max(1, min(8, int(limit or 2)))
+    cap = max(1, min(MAX_PROFILES_LIMIT, int(limit or 2)))
     selected = []
     seen = set()
     for row in candidates:
@@ -448,7 +504,7 @@ def catalog_hook_profiles(catalog_path, extensions_dir='', limit=2, hooks=None,
             candidates.append((_dir_tool_rank(item), 1 if item['host_imports'] else 0,
                                rank, item['id'], item, name))
     candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3], row[5]))
-    cap = max(1, min(8, int(limit or 2)))
+    cap = max(1, min(MAX_PROFILES_LIMIT, int(limit or 2)))
     profiles = []
     # 去重键必须带扩展 id：before-llm-messages 这类热点 hook 几乎每个插件都会声明，
     # 只按 hook 名去重会让排在前面的扩展独吞，后面插件的同名 hook 永远注册不上。
@@ -477,7 +533,7 @@ def catalog_tool_profiles(catalog_path, extensions_dir='', limit=2, data_dir=Non
         candidates.append((_dir_tool_rank(item), 1 if item['host_imports'] else 0,
                            len(item['tools']), item['id'], item))
     candidates.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
-    cap = max(1, min(8, int(limit or 2)))
+    cap = max(1, min(MAX_PROFILES_LIMIT, int(limit or 2)))
     profiles = []
     for _, _, _, ident, item in candidates[:cap]:
         profiles.append({'extensionPath': str(item['file']), 'extensionId': ident,
@@ -495,7 +551,7 @@ def discover_profiles(catalog_path, extensions_dir='', limit=2, data_dir=None) -
     足以填满任何 maxProfiles，296 个 hook 型扩展于是永远进不了自动模式；这里改成
     三条道 1:1:1 轮转。
     """
-    cap = max(1, min(8, int(limit or 2)))
+    cap = max(1, min(MAX_PROFILES_LIMIT, int(limit or 2)))
     lanes = [
         [dict(item, kind='provider') for item in catalog_profiles(catalog_path, extensions_dir, cap)],
         [dict(item, kind='hook') for item in
@@ -534,6 +590,135 @@ def chat_context(message) -> dict:
             'model': None, 'provider': None,
             'visionEnabled': None, 'searchEnabled': None, 'proactive': None,
             'sessionId': None}
+
+
+# ── media.download 的宿主适配 ────────────────────────────────────────────────
+# 宿主 0.4 交给 media.download 的 ctx 里带 `onebot` 与 `sender` 两个**活对象**
+# （sender.js 的 SendQueue + onebot 客户端）。桥每次调用是一个独立 node 进程、
+# 载荷只能走 argv 的 JSON —— **函数没法序列化**，所以这两个槽位只给数据：
+#   · sender 一律 None：扩展里 `if (sender?.sendMedia)` 判定为假，走降级分支，
+#     不发送但照常下载，并把 filePath 放进返回值（media-download/bili.js:655 与
+#     douyin.js:56 都写了这条降级路，sender 缺失是它们预期内的形态）；
+#   · onebot 只给 selfId / selfNickname 这类标量，getMsg / sendSegments 之类一律没有。
+# 真正发出去由 Python 侧用 runtime 的发送通道完成（限频、去重、留档都在那条链路上），
+# 桥不在子进程里直发 —— 与宿主 sender.js:380「插件不得绕过 SendQueue 直发」同向。
+MAX_MEDIA_LINKS_PER_MESSAGE = 3
+_MEDIA_URL_RE = re.compile(r'https?://[^\s"\'<>，。！？）)】]+', re.I)
+_MEDIA_SHORT_RE = re.compile(r'(?:b23\.tv|v\.douyin\.com)/[A-Za-z0-9_-]+', re.I)
+
+
+def _extract_media_urls(text, limit=MAX_MEDIA_LINKS_PER_MESSAGE) -> list:
+    """从文本里挑候选链接，逐字对齐 media-links.js 的 extractCandidateUrls。
+
+    带协议的 http(s) 全收；另外认不带协议的裸短链（b23.tv / v.douyin.com），
+    群友分享文案里常把协议头吃掉。**不判断平台** —— 归属由扩展自己认领。
+
+    归一化必须去掉句末标点与尾部斜杠：同一个链接会被上面两条正则同时命中
+    （带协议那条保留 `/`，裸短链那条不含 `/`），不归一化就会把同一个视频下两次。
+    """
+    raw_text = str(text or '')
+    found = list(_MEDIA_URL_RE.findall(raw_text))
+    found.extend('https://' + item for item in _MEDIA_SHORT_RE.findall(raw_text))
+    seen = set()
+    out = []
+    cap = max(1, int(limit or MAX_MEDIA_LINKS_PER_MESSAGE))
+    for raw in found:
+        url = re.sub(r'/+$', '', re.sub(r'[.,;:]+$', '', str(raw)))
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(url)
+        if len(out) >= cap:
+            break
+    return out
+
+
+def _media_sender(message, runtime=None):
+    """media.download 的 sender 槽位：跨进程传不了函数，一律 None（见上方说明）。"""
+    return None
+
+
+def _tool_sender(runtime=None) -> str:
+    """本次工具调用是谁发起的（tool.guard 的 context.senderId）。
+
+    工具钩子的签名里没有发送者，硬加参数要改 manager / tool_loop 三层调用链；
+    而 `src/skill_tools.py` 已经在工具环外面用 ContextVar 绑了本轮消息
+    （`tool_context(runtime, turn)`），直接读它最省事。读不到就空串 —— 守卫扩展
+    拿不到发送者时自己决定是放行还是拒绝，桥不编造。
+    """
+    if runtime is None:
+        return ''
+    try:
+        from src import skill_tools
+    except Exception:
+        return ''
+    getter = getattr(skill_tools, 'runtime_tool_context', None)
+    if not callable(getter):
+        return ''
+    try:
+        values = getter(runtime) or {}
+    except Exception:
+        return ''
+    return str(values.get('senderId') or '').strip()
+
+
+def _media_onebot(runtime=None) -> dict:
+    """media.download 的 onebot 槽位：只给能 JSON 序列化的标量，不给任何方法。"""
+    data = {'selfId': '', 'selfNickname': ''}
+    if runtime is None:
+        return data
+    account = getattr(runtime, 'account', None)
+    try:
+        value = account() if callable(account) else ''
+    except Exception:
+        value = ''
+    if value not in (None, ''):
+        data['selfId'] = str(value)
+    for attr in ('nickname', 'self_nickname', 'selfNickname'):
+        try:
+            nick = getattr(runtime, attr, '')
+        except Exception:
+            nick = ''
+        if nick:
+            data['selfNickname'] = str(nick)
+            break
+    return data
+
+
+def _speaker_entry(entry) -> dict:
+    """speaker-format 的消息对象：下划线键 + 驼峰别名各来一份。
+
+    宿主 prompt.js 交给扩展的 `message` 是它自己的驼峰形状（`senderName` /
+    `senderId`），而 Python 这边全用下划线（`sender_name` / `sender_id`）。
+    实测 speaker-identity 的 `speakerLabel(m)` 读的是 `m.senderName || m.name`、
+    `m.senderId || m.userId` —— 只给下划线键，它照样能拼出名字，但 QQ 号那段
+    （`(QQ:10001)`）会永久丢失。桥是最合适的归一化点：调用方只写自己的方言，
+    这里一次补齐，扩展不必为两种形状各写一套。
+    """
+    data = dict(entry) if isinstance(entry, dict) else {}
+    sender = str(data.get('sender_id') or data.get('senderId')
+                 or data.get('user_id') or data.get('userId') or '')
+    # 名字三种来源都认：下划线（qq_app 的方言）、驼峰（宿主方言）、以及
+    # 已经补过一次的 nickname —— 否则 {'senderId','senderName'} 这种半驼峰
+    # 入口会推出空名字，扩展只能显示「未知发送者」。
+    name = str(data.get('name') or data.get('sender_name')
+               or data.get('senderName') or data.get('nickname') or '')
+    aliases = {
+        'senderId': sender,
+        'userId': sender,
+        'senderName': name,
+        'nickname': name,
+        'groupId': str(data.get('group_id') or data.get('groupId')
+                       or data.get('target') or ''),
+        'selfId': str(data.get('self_id') or data.get('selfId') or ''),
+    }
+    # 调用方已经写了的驼峰键不覆盖 —— 它比这里推导出来的更可信。
+    # 推导不出来时写空串而不是留缺失：扩展普遍写 `m.senderName || m.name`，
+    # 缺键和空串对它等价，但空串让"桥确实归一化过"在审计里看得见。
+    for key, value in aliases.items():
+        if not data.get(key):
+            data[key] = value
+    return data
 
 
 def _entry_from_message(message) -> dict:
@@ -1003,7 +1188,7 @@ class QqAgentBridge(PluginBase):
             'extensionsDir': FieldSchema(type='string', label='扩展目录', file_picker='directory',
                                          description='留空则自动使用兼容宿主根下的 plugins 目录。自动模式只从这里挑选扩展，防止误用清单外的路径。'),
             'autoDiscover': FieldSchema(type='bool', label='按市场清单自动选择'),
-            'maxProfiles': FieldSchema(type='int', label='自动选择上限', min=1, max=8,
+            'maxProfiles': FieldSchema(type='int', label='自动选择上限', min=1, max=MAX_PROFILES_LIMIT,
                                        description='每轮最多调用几个扩展；默认 2，越多越慢。'),
             'provider': FieldSchema(type='string', label='provider 名称',
                                     description='例如 message.owner-check；与 hookName 二选一。'),
@@ -1026,7 +1211,7 @@ class QqAgentBridge(PluginBase):
             'toolAllowlist': FieldSchema(type='string', label='允许的工具名（逗号分隔）',
                                          description='留空表示允许所选扩展自己注册的全部工具；宿主自带工具永远不会被列出。'),
             'profiles': FieldSchema(type='string', label='批量配置（JSON）', multiline=True,
-                                    description='可选。数组，每项可覆盖 hostScript/sourceDir/extensionPath/provider/hookName/event/ownerOnly/ownerIds/timeout；最多 8 项。'),
+                                    description='可选。数组，每项可覆盖 hostScript/sourceDir/extensionPath/provider/hookName/event/ownerOnly/ownerIds/timeout；最多 32 项。'),
         },
         default_settings={'enabled': False, 'hostScript': '', 'nodeExe': 'node', 'hostRoot': '', 'sourceDir': '', 'extensionPath': '',
                           'catalogPath': '', 'extensionsDir': '', 'autoDiscover': False, 'maxProfiles': 2,
@@ -1105,14 +1290,14 @@ class QqAgentBridge(PluginBase):
         raw = str(self.get('profiles', '') or '').strip()
         if not raw:
             if self.get('autoDiscover', False):
-                cap = max(1, min(8, int(self.get('maxProfiles', 2) or 2)))
+                cap = max(1, min(MAX_PROFILES_LIMIT, int(self.get('maxProfiles', 2) or 2)))
                 # maxProfiles 是「最多选几个扩展」（字段说明写的就是扩展数），不是
                 # 能力条数：一个插件同时声明 provider + 两个 hook 时，三条能力都要带上，
                 # 否则用户把上限设成 4、却只装了 3 个插件，仍会静默少一条能力。
-                # 先按上限 8 发现，再滤掉 registry 里停用的扩展，最后按扩展分组截断：
+                # 先按上限发现，再滤掉 registry 里停用的扩展，最后按扩展分组截断：
                 # 过滤必须排在截断之前，否则停用的扩展会白占名额，自动模式"挑不出人"。
                 discovered = discover_profiles(self.get('catalogPath', ''),
-                                               resolved['extensions_dir'], 8,
+                                               resolved['extensions_dir'], cap,
                                                data_dir=self._data_dir())
                 if not include_disabled:
                     discovered = [item for item in discovered
@@ -1139,7 +1324,7 @@ class QqAgentBridge(PluginBase):
         if not isinstance(items, list):
             return []
         result = []
-        for item in items[:8]:
+        for item in items[:MAX_PROFILES_LIMIT]:
             if not isinstance(item, dict):
                 continue
             if item.get('enabled', True) is False and not include_disabled:
@@ -1403,9 +1588,16 @@ class QqAgentBridge(PluginBase):
         return text if isinstance(text, str) else reply
 
     async def on_before_tool(self, tool_id, arguments, runtime):
-        """before-tool hook：0.4 里唯一以返回值为契约的 hook，block 真正生效。"""
+        """before-tool hook：0.4 里唯一以返回值为契约的 hook，block 真正生效。
+
+        这里同时是两个能力的落点：hook 型的 before-tool 扩展，以及 provider 型的
+        `tool.guard`（宿主里由 tool-registry.js 在注册表层面调，本仓库的工具环
+        不经过宿主注册表，所以接在同一个钩子上）。两者都按 fail-open 处理 ——
+        守卫扩展挂掉不该让机器人连工具都用不了。
+        """
         tool_id = _strip_tool_prefix(tool_id)
-        context = {'sender_id': '', '_no_owner_gate': True}
+        sender_id = _tool_sender(runtime)
+        context = {'sender_id': sender_id, '_no_owner_gate': True}
         result = {'arguments': dict(arguments or {})}
         for profile in self._event_profiles(context, 'on_before_tool'):
             payload = stage_payload('on_before_tool', message={'tool': tool_id},
@@ -1419,6 +1611,11 @@ class QqAgentBridge(PluginBase):
                 result['reason'] = changes.get('reason') or 'blocked by QQ Agent hook'
             if isinstance(changes.get('arguments'), dict):
                 result['arguments'] = changes['arguments']
+        guard = await self.tool_guard(tool_id, result['arguments'], sender_id=sender_id,
+                                      runtime=runtime)
+        if not guard.get('allow', True):
+            result['block'] = True
+            result['reason'] = guard.get('reason') or 'blocked by tool.guard'
         return result
 
     async def on_after_tool(self, tool_id, arguments, value, runtime):
@@ -1571,6 +1768,238 @@ class QqAgentBridge(PluginBase):
                         'extensionId': _extension_id(profile),
                         'timedOut': bool(result.get('timed_out'))}
         return denied
+
+    # ── 第二轮扩张的 5 个消费点 ────────────────────────────────────────────
+    # 这 5 个能力宿主 0.4 都会问，但本控制台的调用点不在宿主里，所以桥自己接：
+    # 载荷与返回值一律照 0.4 的调用点原文构造（不是桥自己的 payload 外壳），
+    # 扩展拿到的就是它在原生宿主里拿到的那一份。
+    async def tool_guard(self, tool_id, arguments=None, sender_id='', runtime=None) -> dict:
+        """tool.guard → {'allow', 'reason', 'extensionId'}。
+
+        `tool-registry.js` 的契约是同步调用、`false` 或 `{ok:false}` 即拒；这里同样是
+        **fail-open**：扩展报错/超时/不表态一律放行。理由和 message.gate 一样 ——
+        守卫扩展挂掉不该让机器人连工具都用不了。
+
+        context 只填 senderId（access-control 只读它），另外补 kind/chatId 让
+        按群区分的守卫也能用；拿不到就留空串，不编造。
+        """
+        verdict = {'allow': True, 'reason': '', 'extensionId': ''}
+        budget = self._budget_ms()
+        if budget <= 0:
+            return verdict
+        tool_id = _strip_tool_prefix(tool_id)
+        message = {'sender_id': str(sender_id or ''), '_no_owner_gate': True}
+        deadline = time.monotonic() + budget / 1000.0
+        for profile in self._provider_profiles(message, 'tool.guard'):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            payload = {'toolId': tool_id,
+                       'tool': {'id': tool_id, 'name': tool_id},
+                       'context': {'senderId': str(sender_id or ''),
+                                   'arguments': dict(arguments or {})}}
+            result = await self._stage(profile, payload, 'on_before_tool', timeout=left)
+            self._remember(message, result, profile)
+            if result.get('error'):
+                self._note_failure(runtime, profile, result)
+                continue
+            value = result.get('value')
+            if value is False:
+                return {'allow': False, 'reason': 'blocked by tool.guard',
+                        'extensionId': _extension_id(profile)}
+            if isinstance(value, dict) and value.get('ok') is False:
+                return {'allow': False,
+                        'reason': str(value.get('reason') or 'blocked by tool.guard')[:200],
+                        'extensionId': _extension_id(profile)}
+        return verdict
+
+    async def media_download(self, message, runtime=None) -> dict:
+        """media.download → 把消息里的链接交给扩展下载并发送。
+
+        对齐 `app.js` 的 `forwardLinkedMedia` + `media-links.js` 的 `dispatchMediaLinks`：
+        每条消息最多 3 个链接、按扩展顺序问、`!r || r.skip` 换下一个、`r.ok` 即认领、
+        失败时 `friendly` 文案直接发出去。**这里只负责"谁认领了"**，真正的发送由调用方
+        用 runtime 的发送通道完成（桥不直接发消息，避免绕过限频与留档）。
+        """
+        outcome = {'urls': [], 'handled': [], 'failed': [], 'skipped': []}
+        budget = self._budget_ms()
+        if budget <= 0:
+            return outcome
+        text = str((message or {}).get('text') or '')
+        urls = _extract_media_urls(text)
+        if not urls:
+            return outcome
+        outcome['urls'] = urls
+        chat = chat_context(message)
+        sender = _media_sender(message, runtime)
+        onebot = _media_onebot(runtime)
+        profiles = self._provider_profiles(message, 'media.download')
+        if not profiles:
+            outcome['skipped'] = list(urls)
+            return outcome
+        deadline = time.monotonic() + budget / 1000.0
+        for url in urls:
+            claimed = False
+            for profile in profiles:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                payload = {'url': url, 'onebot': onebot, 'sender': sender,
+                           'kind': chat.get('kind') or '', 'chatId': chat.get('chatId') or '',
+                           'chatKey': chat.get('chatKey') or '', 'text': text}
+                result = await self._stage(profile, payload, 'on_prepare', timeout=left)
+                self._remember(message, result, profile)
+                if result.get('error'):
+                    self._note_failure(runtime, profile, result)
+                    continue
+                value = result.get('value')
+                if not isinstance(value, dict) or value.get('skip'):
+                    continue
+                claimed = True
+                if value.get('ok'):
+                    outcome['handled'].append({'url': url, 'extensionId': _extension_id(profile),
+                                               'value': value})
+                else:
+                    outcome['failed'].append({'url': url, 'extensionId': _extension_id(profile),
+                                              'value': value})
+                break
+            if not claimed:
+                outcome['skipped'].append(url)
+        return outcome
+
+    def endpoint_pick(self, model='', runtime=None) -> dict:
+        """llm.endpoint-pick → {'baseUrl','apiKey','model','extensionId'}。
+
+        只问第一个表态的扩展（`llm.js:279` 的 `break`），且**必须有 baseUrl 才算数**；
+        报错/超时/空值一律返回 {}，调用方沿用原配置（fail-open）。
+        """
+        budget = self._budget_ms()
+        if budget <= 0:
+            return {}
+        message = {'_no_owner_gate': True}
+        deadline = time.monotonic() + budget / 1000.0
+        for profile in self._provider_profiles(message, 'llm.endpoint-pick'):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            result = self._stage_sync(profile, {'model': str(model or '')}, timeout=left)
+            self._remember(message, result, profile)
+            if result.get('error'):
+                self._note_failure(runtime, profile, result)
+                continue
+            value = result.get('value')
+            if not isinstance(value, dict) or not value.get('baseUrl'):
+                continue
+            picked = {'baseUrl': str(value.get('baseUrl')).strip(),
+                      'extensionId': _extension_id(profile)}
+            # llm.js:282 用 picked.id 当账号 id（endpoint-feedback 的 accountId 就是它），
+            # 与"哪个扩展"不是一回事，两个都带上，别混用。
+            if value.get('id'):
+                picked['id'] = str(value.get('id')).strip()
+            if value.get('apiKey'):
+                picked['apiKey'] = str(value.get('apiKey')).strip()
+            if value.get('model'):
+                picked['model'] = str(value.get('model')).strip()
+            return picked
+        return {}
+
+    async def endpoint_pick_async(self, model='', runtime=None) -> dict:
+        """`endpoint_pick` 的异步版：载荷与返回值完全一样，只是不阻塞事件循环。
+
+        主回复链在协程里跑，同步版会卡住整个事件循环最多 preAiBudgetMs（默认 1.5 秒）；
+        这一条每次模型请求都要走，必须用异步。
+        """
+        budget = self._budget_ms()
+        if budget <= 0:
+            return {}
+        message = {'_no_owner_gate': True}
+        deadline = time.monotonic() + budget / 1000.0
+        for profile in self._provider_profiles(message, 'llm.endpoint-pick'):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            result = await self._stage(profile, {'model': str(model or '')}, 'on_pre_ai', timeout=left)
+            self._remember(message, result, profile)
+            if result.get('error'):
+                self._note_failure(runtime, profile, result)
+                continue
+            value = result.get('value')
+            if not isinstance(value, dict) or not value.get('baseUrl'):
+                continue
+            picked = {'baseUrl': str(value.get('baseUrl')).strip(),
+                      'extensionId': _extension_id(profile)}
+            if value.get('id'):
+                picked['id'] = str(value.get('id')).strip()
+            if value.get('apiKey'):
+                picked['apiKey'] = str(value.get('apiKey')).strip()
+            if value.get('model'):
+                picked['model'] = str(value.get('model')).strip()
+            return picked
+        return {}
+
+    async def endpoint_feedback_async(self, payload, runtime=None) -> bool:
+        """`endpoint_feedback` 的异步版（主回复链用这个）。"""
+        budget = self._budget_ms()
+        if budget <= 0:
+            return False
+        message = {'_no_owner_gate': True}
+        deadline = time.monotonic() + budget / 1000.0
+        for profile in self._provider_profiles(message, 'llm.endpoint-feedback'):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            result = await self._stage(profile, dict(payload or {}), 'on_pre_ai', timeout=left)
+            self._remember(message, result, profile)
+            if result.get('error'):
+                self._note_failure(runtime, profile, result)
+            return bool(result.get('ok'))
+        return False
+
+    def endpoint_feedback(self, payload, runtime=None) -> bool:
+        """llm.endpoint-feedback → 把本次调用结果回报给扩展（只问第一个，忽略返回值）。"""
+        budget = self._budget_ms()
+        if budget <= 0:
+            return False
+        message = {'_no_owner_gate': True}
+        deadline = time.monotonic() + budget / 1000.0
+        for profile in self._provider_profiles(message, 'llm.endpoint-feedback'):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            result = self._stage_sync(profile, dict(payload or {}), timeout=left)
+            self._remember(message, result, profile)
+            if result.get('error'):
+                self._note_failure(runtime, profile, result)
+            return bool(result.get('ok'))
+        return False
+
+    async def speaker_format(self, entry, runtime=None) -> str:
+        """message.speaker-format → 发言人标签（拿不到就返回空串，调用方用原标签）。
+
+        `prompt.js:307` 的契约是同步取第一个 provider 的 fn 并 `await`；
+        入参 `{message, notes, selfLabel}`，返回值是整段标签文本。
+        """
+        budget = self._budget_ms()
+        if budget <= 0 or not isinstance(entry, dict):
+            return ''
+        message = {'_no_owner_gate': True}
+        payload = {'message': _speaker_entry(entry),
+                   'notes': dict(entry.get('notes') or {}),
+                   'selfLabel': '我'}
+        deadline = time.monotonic() + budget / 1000.0
+        for profile in self._provider_profiles(message, 'message.speaker-format'):
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            result = await self._stage(profile, payload, 'on_prepare', timeout=left)
+            self._remember(message, result, profile)
+            if result.get('error'):
+                self._note_failure(runtime, profile, result)
+                continue
+            value = result.get('value')
+            if isinstance(value, str) and value.strip():
+                return value.strip()[:200]
+        return ''
 
     # ── 给 WP2 工具环用的便捷入口 ──────────────────────────────────────────
     async def transform_messages(self, conversation, message=None) -> list:

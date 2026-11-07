@@ -22,8 +22,10 @@ from src import extension_registry, skill_market
 from src.qq_app import create_app
 
 _T1_BODY = b'ctx.registerTool({ name: "demo" });\n'
-_T4_BODY = (b'const llm = require("../../src/llm.js");\n'
-            b'ctx.registerTool({ name: "deep" });\n')
+# 入口自己上溯 3 层 = 逃出运行目录（<source>/skills-host-<pid>/0000-<id>/），
+# 加载期必然失败 => T6-disabled；2 层上溯能解析到 <source>/src，不算阻塞。
+_BLOCKED_BODY = (b'const llm = require("../../../src/llm.js");\n'
+                 b'ctx.registerTool({ name: "deep" });\n')
 
 
 def _manifest(ident, **extra):
@@ -138,15 +140,15 @@ class InstallEndpointTests(_Case):
         self.assertEqual(data['note'], '市场安装并启用')
         self.assertIsNone(data['error'])
 
-    def test_t4_installs_but_stays_disabled(self):
-        zip_path = _skill_zip(self.market / 'deep.zip', 'deep-skill', body=_T4_BODY)
+    def test_blocked_tier_installs_but_stays_disabled(self):
+        zip_path = _skill_zip(self.market / 'deep.zip', 'deep-skill', body=_BLOCKED_BODY)
         data = self._post(self._client(), '/api/skills/install',
                           {'file': str(zip_path)}).json()
         self.assertTrue(data['ok'], data['error'])
-        self.assertEqual(data['tier'], 'T4-host-source')
+        self.assertEqual(data['tier'], 'T6-disabled')
         self.assertFalse(data['enabled'])
         self.assertIn('未启用', data['note'])
-        self.assertIn('T4-host-source', data['note'])
+        self.assertIn('T6-disabled', data['note'])
 
     def test_enable_false_is_explicitly_off(self):
         zip_path = _skill_zip(self.market / 'demo-skill.zip', 'demo-skill')

@@ -7,6 +7,17 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from . import PluginBase, PluginMeta, FieldSchema
 
+
+def _proactive_persona(runtime, kind, target):
+    """主动消息也要走会话绑定：直接取全局人设会把别人群里的人设串到私信上。"""
+    try:
+        from ..persona_bindings import resolve_persona
+        persona = resolve_persona(runtime, {'kind': kind, 'target': str(target), 'text': ''})
+        return persona.full_prompt()
+    except Exception:
+        return runtime.style.full_prompt() if hasattr(runtime, 'style') else ''
+
+
 _TZ_CST = timezone(timedelta(hours=8))
 
 
@@ -174,7 +185,7 @@ class SilencePing(PluginBase):
                     {"role": "system", "content": "你在给一个朋友发私信，他好久没说话了。发一句简短自然的关心话，不超过15字，不要带解释。"},
                     {"role": "user",   "content": "生成一句关心的私信"},
                 ],
-                system_prompt=runtime.style.full_prompt(),max_tokens=64,
+                system_prompt=_proactive_persona(runtime,'private',qq_id),max_tokens=64,
             )
             return (result or "").strip()
         except Exception:

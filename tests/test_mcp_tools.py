@@ -295,7 +295,7 @@ class StopTest(ProviderCase):
 class SkillToolsWiringTest(ProviderCase):
     def test_counts_identical_without_external_server(self):
         runtime = _Runtime(self.tmp)
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             live = skill_tools.eligible_skills(runtime=runtime)
             with mock.patch.object(skill_tools, '_mcp_tools', lambda runtime=None: []):
                 plain = skill_tools.eligible_skills(runtime=runtime)
@@ -305,7 +305,7 @@ class SkillToolsWiringTest(ProviderCase):
 
     def test_repo_data_counts_identical(self):
         runtime = _Runtime(REPO)
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             live = skill_tools.eligible_skills(runtime=runtime)['counts']
             with mock.patch.object(skill_tools, '_mcp_tools', lambda runtime=None: []):
                 plain = skill_tools.eligible_skills(runtime=runtime)['counts']
@@ -313,10 +313,10 @@ class SkillToolsWiringTest(ProviderCase):
 
     def test_counts_grow_by_external_tool_count(self):
         runtime = _Runtime(self.tmp)
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             base = skill_tools.eligible_skills(runtime=runtime)['counts']
         self.register(_entry('fake'))
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             plan = skill_tools.eligible_skills(runtime=runtime)
         external = plan['mcpTools']
         self.assertEqual(len(external), 4)
@@ -332,7 +332,7 @@ class SkillToolsWiringTest(ProviderCase):
         self.register(_entry('fake'))
         args = dict(node='nope-node', host_script=str(self.tmp / 'host.js'),
                     source_dir=str(self.tmp), limit=0)
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             report = skill_tools.register_skills(runtime, **args)
         self.assertEqual(report['counts']['mcpTools'], 4)
         names = sorted(one for one in runtime.tool_registry.names()
@@ -343,7 +343,7 @@ class SkillToolsWiringTest(ProviderCase):
         outcome = asyncio.run(spec.handler('fake__echo_cn', {'text': '注册后调用'}))
         self.assertTrue(outcome['ok'], outcome)
         self.assertIn('注册后调用', json.dumps(outcome, ensure_ascii=False))
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             skill_tools.register_skills(runtime, **args)
         again = sorted(one for one in runtime.tool_registry.names()
                        if one.startswith('fake__'))

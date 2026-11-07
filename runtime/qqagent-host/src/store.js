@@ -247,6 +247,44 @@ export class ChatStore {
     return all.slice(0, start).slice(-Math.max(1, Number(limit) || 1));
   }
 
+  /** 导出整个存档（深拷贝，供发布/备份用；调用方改了也不影响内存里的状态）。 */
+  exportAll(chatKey) {
+    const st = this.#state(chatKey);
+    return {
+      chatKey: st.chatKey,
+      nextLocalId: st.nextLocalId,
+      messages: st.messages.map((m) => ({ ...m, media: Array.isArray(m.media) ? m.media.map((x) => ({ ...x })) : [] }))
+    };
+  }
+
+  /**
+   * 用外部数据**覆盖**这个存档（读取远端存档用）。
+   * 整份替换而不是合并：合并会留下"本地有、远端没有"的残留，读回来的东西就不干净了。
+   * @returns {number} 写进去的消息条数
+   */
+  importAll(chatKey, messages) {
+    const list = (Array.isArray(messages) ? messages : []).filter((m) => m && typeof m === 'object');
+    const st = this.#state(chatKey);
+    st.messages = list.map((m, i) => ({
+      id: Number.isFinite(Number(m.id)) ? Number(m.id) : i + 1,
+      mid: m.mid ?? null,
+      ts: Number(m.ts) || Date.now(),
+      senderId: String(m.senderId ?? ''),
+      senderName: String(m.senderName ?? ''),
+      text: String(m.text ?? ''),
+      self: m.self === true,
+      read: m.read !== false,
+      reply: m.reply ?? null,
+      media: Array.isArray(m.media) ? m.media : [],
+      isPoke: Boolean(m.isPoke),
+      atMe: m.atMe ?? null,
+      atNames: Array.isArray(m.atNames) ? m.atNames : []
+    }));
+    st.nextLocalId = st.messages.reduce((n, m) => Math.max(n, m.id), 0) + 1;
+    saveChat(st);
+    return st.messages.length;
+  }
+
   findByMid(chatKey, mid) {
     const st = this.#state(chatKey);
     const target = String(mid);
@@ -287,6 +325,16 @@ export class ChatStore {
         if (x && x.url && !seen.has(x.url)) { m.media.push(x); seen.add(x.url); }
       }
     }
+    saveChat(st);
+    return true;
+  }
+
+  /** 改某条消息的正文（聊天页"修改"用）。返回是否改到了。 */
+  updateByLocalId(chatKey, localId, { text } = {}) {
+    const st = this.#state(chatKey);
+    const m = st.messages.find((x) => x.id === Number(localId));
+    if (!m) return false;
+    if (text != null) m.text = String(text);
     saveChat(st);
     return true;
   }

@@ -41,6 +41,7 @@ installer/*.sha256
 
 # 运行时 Node 二进制（体积大，构建机自备，见 BUILDING.md）
 runtime/node/
+node_modules/
 
 # 编辑器
 .vscode/

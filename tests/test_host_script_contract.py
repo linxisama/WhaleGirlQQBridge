@@ -9,6 +9,10 @@ wiki-query 一类 skill 因此永远回「缺少要查的名字」。
 修法是 dual-shape：ctx 上摊平 payload（老式 `execute(payload)` 仍读得到字段），
 第二参交真 payload（新式 `execute(ctx, args)` 拿得到参数）。本文件只读文本断言，
 防止两份副本之一漏打补丁、或日后回退成单参写法。
+
+摊平顺序还带信任边界（任务书 P1-2）：payload 在前，可信会话 ctx 与宿主回调在后覆盖。
+模型实参因此伪造不了 chatKey/senderId/target，也换不掉 fetch/log/metadata；
+业务参数仍从第二参和摊平后的 ctx 两头都读得到。
 """
 from __future__ import annotations
 
@@ -26,6 +30,8 @@ CTX_FLATTENS_PAYLOAD = re.compile(r"^\s*const toolCtx\s*=[^\n]*\.\.\.payload[^\n
 DUAL_SHAPE_CALL = re.compile(r"tool\.execute\(\s*toolCtx\s*,\s*payload\s*\)")
 # 旧写法：第一参 payload、第二参 ctx 字面量。命中即回退。
 OLD_SHAPE_CALL = re.compile(r"tool\.execute\(\s*payload\s*,\s*\{")
+# 信任边界（P1-2）：toolCtx 里这些片段的先后顺序就是覆盖顺序，越靠后越不可被伪造。
+TOOLCTX_ORDER = ("...payload", "...context", "signal: null", "log:", "metadata:", "fetch: toolFetch(")
 
 
 def host_text(path: Path) -> str:
@@ -59,6 +65,17 @@ class HostScriptContractMixin:
         self.assertIn("...payload", text, "ctx 没有摊平 payload：%s" % self.path)
         self.assertIn("tool.execute(toolCtx, payload)", text,
                       "第二参不是 payload：%s" % self.path)
+
+    def test_trusted_context_and_host_callbacks_win_over_payload(self):
+        """P1-2：payload 先摊平，可信 ctx 与宿主回调在后覆盖，模型实参伪造不生效。"""
+        line = [item for item in host_text(self.path).splitlines() if "const toolCtx =" in item][0]
+        positions = []
+        for token in TOOLCTX_ORDER:
+            self.assertIn(token, line, "toolCtx 缺少 %s：%s" % (token, self.path))
+            positions.append(line.index(token))
+        self.assertEqual(
+            positions, sorted(positions),
+            "toolCtx 合并顺序不对，可信字段会被模型实参覆盖：%s\n%s" % (self.path, line))
 
 
 class RuntimeHostScriptTest(HostScriptContractMixin, unittest.TestCase):

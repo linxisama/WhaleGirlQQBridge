@@ -25,6 +25,7 @@ import itertools
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -56,6 +57,14 @@ FILE_SUFFIX = ".jsonl"
 SCAN_BYTES = 512 * 1024
 #: 从文件补齐时最多回看几个文件。
 SCAN_FILES = 3
+#: 脱敏用的遮蔽串（落盘与内存环里都只留它，原文不落地）。
+MASK = "***"
+#: 日志目录总占用的硬上限（字节）：超了就从最旧的文件开始删，绝不删正在写的那个。
+TOTAL_BYTES = 40 * 1024 * 1024
+#: 同一条 (level, message) 在这个秒数内重复只写第一次 + 一条「重复 N 次」。
+COALESCE_WINDOW = 5.0
+#: 每累计写这么多字节就核一次目录总占用（不然每条都要 glob 一遍目录）。
+_TRIM_EVERY_BYTES = 1024 * 1024
 
 _KEYS = ("id", "ts", "level", "source", "message", "detail", "code", "extra")
 
@@ -85,9 +94,50 @@ def _one_line(text: str) -> str:
     return " ".join(text.replace("\r", " ").replace("\n", " ").replace("\t", " ").split())
 
 
+_RE_BEARER = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=\-]{8,}")
+_RE_SECRET = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password)"
+    r"[\"']?\s*[:=]\s*\S+"
+)
+_RE_SK = re.compile(r"\bsk-[A-Za-z0-9_\-]{8,}")
+#: 7 位以上连续数字：QQ 号、手机号一类账号，留着就等于泄漏。
+_RE_LONG_DIGITS = re.compile(r"(?<!\d)\d{7,}(?!\d)")
+
+
+def redact(text: Any) -> str:
+    """落盘前的脱敏：Bearer 令牌 / api_key=… / sk-xxx / 长数字账号一律遮成 ***。
+
+    只在明显是密钥或账号的位置动手，普通文字与短数字（端口、行号）保持原样。
+    """
+    out = _as_text(text)
+    if not out:
+        return out
+    try:
+        out = _RE_BEARER.sub(lambda m: m.group(1) + " " + MASK, out)
+        out = _RE_SECRET.sub(lambda m: m.group(1) + "=" + MASK, out)
+        out = _RE_SK.sub("sk-" + MASK, out)
+        out = _RE_LONG_DIGITS.sub(MASK, out)
+    except Exception:
+        return out
+    return out
+
+
 def _norm_level(level: Any) -> str:
     text = _as_text(level).strip().lower()
     return text if text in LEVELS else "info"
+
+
+def _redact_value(value: Any, depth: int = 0) -> Any:
+    """extra 里的字符串也要脱敏；容器往下走有限几层，其它类型原样返回。"""
+    if isinstance(value, str):
+        return redact(value)
+    if depth >= 3:
+        return value
+    if isinstance(value, dict):
+        return {_as_text(k): _redact_value(v, depth + 1) for k, v in list(value.items())[:50]}
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item, depth + 1) for item in list(value)[:50]]
+    return value
 
 
 def _norm_extra(extra: Any) -> Dict[str, Any]:
@@ -95,7 +145,7 @@ def _norm_extra(extra: Any) -> Dict[str, Any]:
         return {}
     out: Dict[str, Any] = {}
     for key, value in extra.items():
-        out[_clip(_as_text(key) or "key", CODE_MAX)] = value
+        out[_clip(_as_text(key) or "key", CODE_MAX)] = _redact_value(value)
     return out
 
 
@@ -209,10 +259,10 @@ def make_entry(
 ) -> Dict[str, Any]:
     """造一条日志条目（不落盘、不抛）。非法 level 归 info，非字符串入参走 str()。"""
     lvl = _norm_level(level)
-    text = _clip(_one_line(_as_text(message)), MESSAGE_MAX)
-    body = _clip(_as_text(detail), DETAIL_MAX)
+    text = _clip(redact(_one_line(_as_text(message))), MESSAGE_MAX)
+    body = _clip(redact(_as_text(detail)), DETAIL_MAX)
     src = _clip(_one_line(_as_text(source)), SOURCE_MAX)
-    trc = _clip(_one_line(_as_text(code)), CODE_MAX)
+    trc = _clip(redact(_one_line(_as_text(code))), CODE_MAX)
     extras = _norm_extra(extra)
     ts = _iso(now)
     return {
@@ -315,6 +365,9 @@ class AppLog:
         ring: int = RING,
         roll_bytes: int = ROLL_BYTES,
         roll_keep: int = ROLL_KEEP,
+        total_bytes: int = TOTAL_BYTES,
+        coalesce_window: float = COALESCE_WINDOW,
+        coalesce_clock: Optional[Callable[[], float]] = None,
         clock: Optional[Callable[[], Any]] = None,
     ) -> None:
         self.data_dir = Path(os.path.abspath(str(data_dir))) if data_dir else None
@@ -333,6 +386,20 @@ class AppLog:
             self._roll_keep = max(1, int(roll_keep))
         except (TypeError, ValueError):
             self._roll_keep = ROLL_KEEP
+        try:
+            self._total_bytes = max(1, int(total_bytes))
+        except (TypeError, ValueError):
+            self._total_bytes = TOTAL_BYTES
+        # 总上限不能小于一个轮转文件，否则「正在写的那个」永远顶破上限。
+        self._total_bytes = max(self._total_bytes, self._roll_bytes)
+        try:
+            self._coalesce_window = max(0.0, float(coalesce_window))
+        except (TypeError, ValueError):
+            self._coalesce_window = COALESCE_WINDOW
+        self._coalesce_clock = coalesce_clock
+        self._pending: Optional[Dict[str, Any]] = None
+        #: 距上次总量检查已写多少字节（每写一次就 glob 一遍目录太贵）。
+        self._bytes_since_trim = 0
         self._clock = clock
         self.write_failures = 0
         self._cleared_ts = ""
@@ -375,11 +442,13 @@ class AppLog:
                 "extra": {},
             }
         with self._lock:
+            if self._coalesce(entry):
+                return dict(entry)  # 被折叠：只加计数，不再占环、不再写盘
             self._ring.append(entry)
             try:
                 self._append(entry)
             except Exception:
-                self.write_failures += 1
+                self._safe_fail()
         return dict(entry)
 
     def error(self, source: Any, message: Any, **kw: Any) -> Dict[str, Any]:
@@ -432,6 +501,69 @@ class AppLog:
             body = (body + chr(10) + trace) if body else trace
         return self.record("error", source, text, detail=body, code=_as_text(code) or kind)
 
+    # -- 重复折叠 ----------------------------------------------------------
+    def _mono(self) -> float:
+        """折叠窗口用的单调秒；注入的钟坏掉就退回系统钟。"""
+        if self._coalesce_clock is None:
+            return time.monotonic()
+        try:
+            return float(self._coalesce_clock())
+        except Exception:
+            return time.monotonic()
+
+    def _safe_fail(self) -> None:
+        """写盘失败只计数，计数本身也不许把调用方带崩。"""
+        try:
+            self.write_failures += 1
+        except Exception:
+            pass
+
+    def _coalesce(self, entry: Dict[str, Any]) -> bool:
+        """同一 (level, message) 在窗口内重复时折叠本条；返回 True 表示被折叠。
+
+        窗口内只留第一条，窗口结束后补一条「重复 N 次：原文」的汇总，
+        这样刷屏的错误既不会挤掉上下文，次数也不会丢。
+        """
+        key = (entry.get("level"), entry.get("message"))
+        moment = self._mono()
+        pending = self._pending
+        if pending is not None:
+            if key == pending["key"] and moment - pending["at"] <= self._coalesce_window:
+                pending["count"] += 1
+                return True
+            self._flush_repeats()
+        self._pending = {"key": key, "at": moment, "count": 1, "entry": entry}
+        return False
+
+    def _flush_repeats(self) -> None:
+        """把攒下的重复次数落成一条汇总（只重复过 1 次就什么也不写）。"""
+        pending, self._pending = self._pending, None
+        if not pending or pending["count"] <= 1:
+            return
+        first = pending["entry"]
+        try:
+            summary = make_entry(
+                first.get("level"),
+                first.get("source"),
+                "重复 {} 次：{}".format(pending["count"], first.get("message")),
+                detail=first.get("detail"),
+                code=first.get("code"),
+                now=first.get("ts"),
+            )
+        except Exception:
+            self._safe_fail()
+            return
+        self._ring.append(summary)
+        try:
+            self._append(summary)
+        except Exception:
+            self._safe_fail()
+
+    def flush_repeats(self) -> None:
+        """收尾用：把还没到期的重复计数立刻落盘（进程退出/测试断言前调用）。"""
+        with self._lock:
+            self._flush_repeats()
+
     # -- 落盘与滚动 --------------------------------------------------------
     def _path_for(self, ts: Any) -> Path:
         return self._dir / "{}{}{}".format(FILE_PREFIX, _day_key(ts), FILE_SUFFIX)
@@ -473,6 +605,46 @@ class AppLog:
             except Exception:
                 return "{}"
 
+    def _trim_every(self) -> int:
+        """核总量的间隔：不超过一个轮转文件，总量最多超一个文件的量。"""
+        return max(1, min(_TRIM_EVERY_BYTES, self._roll_bytes))
+
+    def _trim_total(self, path: Path) -> None:
+        """总占用硬上限：从最旧的日志文件开始删，正在写的那个永不删。"""
+        try:
+            found = [item for item in self._dir.glob(FILE_PREFIX + "*" + FILE_SUFFIX)]
+        except OSError:
+            return
+        sized = []
+        total = 0
+        for item in found:
+            if item == path:
+                continue
+            try:
+                if not item.is_file():
+                    continue
+                size = item.stat().st_size
+            except OSError:
+                continue
+            sized.append((_mtime(item), item))
+            total += size
+        try:
+            active = path.stat().st_size if path.exists() else 0
+        except OSError:
+            active = 0
+        if active + total <= self._total_bytes:
+            return
+        sized.sort()  # 最旧在前
+        for _stamp, item in sized:
+            if active + total <= self._total_bytes:
+                break
+            try:
+                size = item.stat().st_size
+                item.unlink()
+            except OSError:
+                continue
+            total -= size
+
     def _append(self, entry: Dict[str, Any]) -> None:
         path = self._path_for(entry.get("ts"))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -483,9 +655,14 @@ class AppLog:
                 too_big = False
             if too_big:
                 self._roll(path)
+                self._bytes_since_trim = 0
         line = self._dump(entry)
+        if self._bytes_since_trim <= 0 or self._bytes_since_trim >= self._trim_every():
+            self._trim_total(path)  # 写之前先腾地方，不等磁盘满
+            self._bytes_since_trim = 0
         with open(path, "a", encoding="utf-8", newline=chr(10)) as handle:
             handle.write(line + chr(10))
+        self._bytes_since_trim += len(line) + 1
 
     def files(self) -> List[Path]:
         """当前日志目录里的 jsonl 文件（新→旧，按修改时间）。"""
@@ -515,6 +692,7 @@ class AppLog:
         size = _clamp_limit(limit)
         match = _make_matcher(level, source, query, since)
         with self._lock:
+            self._flush_repeats()  # 读之前把攒着的重复次数落成汇总，别让界面漏掉
             snapshot = list(self._ring)
             cleared_marker = self._cleared_ts
             cleared_ids = frozenset(self._cleared_ids)

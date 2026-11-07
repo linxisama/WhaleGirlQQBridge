@@ -193,11 +193,12 @@ class HostFetchContractTest(unittest.TestCase):
             self.assertIn('function toolFetch(manifest)', text, path)
             self.assertIn("includes('web_fetch')", text, path)
             self.assertIn('未声明 web_fetch 权限', text, path)
-            # payload 仍是最后的展开：fetch 挂在它前面，覆盖顺序不变。
+            # P1-2 之后 payload 先摊平，可信 ctx 与宿主回调在后覆盖；fetch 也在覆盖侧，
+            # 模型实参换不掉它。
             line = [item for item in text.splitlines() if 'const toolCtx =' in item][0]
             self.assertIn('fetch: toolFetch(', line)
-            self.assertLess(line.index('fetch: toolFetch('), line.index('...context'))
-            self.assertLess(line.index('...context'), line.index('...payload'))
+            self.assertLess(line.index('...payload'), line.index('...context'))
+            self.assertLess(line.index('...context'), line.index('fetch: toolFetch('))
 
 
 if __name__ == '__main__':

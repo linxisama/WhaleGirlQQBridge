@@ -65,6 +65,12 @@ Source: "docs\控制台操作指南.md"; DestDir: "{app}\docs"; Flags: ignorever
 [InstallDelete]
 ; 只移除上版内置网页入口，不触碰数据目录与任何用户文件。
 Type: files; Name: "{app}\浏览器兼容启动.cmd"
+; 5.2.112 起不再随包发 Qt6Pdf（全项目无引用）与多余语言包。覆盖安装时旧文件不会自己消失，
+; 必须在这里点名删掉，否则升级后体积只增不减；[InstallDelete] 在 [Files] 之前执行，
+; 保留下来的 4 个 .qm 会被随后的 [Files] 重新铺回去。
+Type: files; Name: "{app}\_internal\PyQt6\Qt6\bin\Qt6Pdf.dll"
+Type: files; Name: "{app}\_internal\PyQt6\Qt6\plugins\imageformats\qpdf.dll"
+Type: files; Name: "{app}\_internal\PyQt6\Qt6\translations\*.qm"
 [UninstallDelete]
 ; 卸载时把 onedir 的 _internal\ 整棵树删掉：里面可能有运行时生成/改名过的文件，
 ; 不在安装记录里，光靠 [Files] 的卸载清单会留下空目录与残留。

@@ -50,6 +50,33 @@ TRIGGERS={
     'short_followup':'成功回复后开启同一人的跟聊窗口；官方群聊仍只能接收平台推送的@消息。',
 }
 LABELS={'ready':'已接入','limited':'部分可用','unavailable':'接入受限','needs_config':'待配置','needs_data':'待数据','external':'外部服务','unverified':'待验证'}
+SOURCE_LABELS={'builtin':'内置','mod':'目录包','custom':'自定义'}
+
+def plugin_source(pid,runtime):
+    """插件来源：(plugin_source, source_detail)。目录包带 mod_id，其余为空串。
+
+    控制台「插件」页要一眼分清两条链：内置模块 / 目录包 mod / 自己装的裸 .py。
+    最小 FakeRuntime（测试里那种没有 plugins 属性的）和任何异常都退回内置，不抛。
+    """
+    try:
+        plugins=getattr(runtime,'plugins',None)
+        if plugins is None:
+            return 'builtin',''
+        try:
+            mod_id=str(plugins.mod_id_for_plugin(pid) or '')
+        except Exception:
+            mod_id=''
+        if mod_id:
+            return 'mod',mod_id
+        try:
+            custom_ids=plugins.custom_plugin_ids() or ()
+        except Exception:
+            custom_ids=()
+        if pid in custom_ids:
+            return 'custom',''
+    except Exception:
+        pass
+    return 'builtin',''
 
 def apply_capabilities(items,runtime):
     onebot_mode = runtime.mode in {'onebot', 'qqbridge'}
@@ -141,7 +168,9 @@ def apply_capabilities(items,runtime):
                        'icebreaker'}:
                 set_status('limited', '官方 QQ 的主动消息受配额限制（每天每会话有限），'
                                       '超额时平台会拒绝并在运行记录里写明原因。')
-        item.update(capability_status=status,capability_label=LABELS[status],status_note=note,
+        source,source_detail=plugin_source(pid,runtime)
+        item.update(plugin_source=source,source_label=SOURCE_LABELS[source],source_detail=source_detail,
+                    capability_status=status,capability_label=LABELS[status],status_note=note,
                     available=status!='unavailable',availability_label=LABELS[status],
                     enabled_label=('指令模式' if pid=='poke_counter' and not onebot_mode else LABELS[status] if status in {'unavailable','needs_config','needs_data','unverified'} else '已启用'))
         item['runtime_state']='已停用' if not item.get('enabled') else '待启动' if not runtime.running else LABELS[status]

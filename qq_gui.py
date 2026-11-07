@@ -5487,6 +5487,8 @@ class PluginTab(QWidget):
         self._loaded = False
         # 上次成功渲染的数据指纹：一样就不再重建行控件（重建 63 行约 75 毫秒）
         self._signature = None
+        # 内核插件（plugin_core）数量文案，由 refresh 读一次，_filter_rows 拼进 summary
+        self._core_summary = ""
         # 用户自己装的插件（只有这些允许删除；内置插件永远不在这个集合里）
         self._custom_ids = set()
         root = QVBoxLayout(self)
@@ -5682,11 +5684,15 @@ class PluginTab(QWidget):
                           if isinstance(item, dict) and item.get("id")}
         else:
             custom_ids = set()
+        # 内核插件是另一条链：只取数量写进 summary，失败也不影响上面的插件列表
+        self._core_summary = self._core_summary_text()
         self.notice.setText("列表已更新。开关表示允许执行；“待配置 / 待数据 / 接入受限”会说明未生效的原因。")
         # 数据跟上次一模一样就直接返回：重建 63 行控件约 75 毫秒，每次切回插件页都重建会明显顿一下。
         signature = (json.dumps(plugins, sort_keys=True, ensure_ascii=False, default=str),
                      tuple(sorted(custom_ids)))
         if signature == self._signature and self._rows:
+            # 行控件不重建，但 summary 要跟着内核插件数量更新
+            self._filter_rows()
             return
         self._signature = signature
         self._plugins = plugins
@@ -5712,6 +5718,25 @@ class PluginTab(QWidget):
         self.rows_layout.addStretch(1)
         self._filter_rows()
 
+    @staticmethod
+    def _source_text(plugin: dict) -> str:
+        """来源文案：目录包带 mod_id，其它用 source_label；老数据回退「内置」。"""
+        label = str(plugin.get("source_label") or "内置")
+        if plugin.get("plugin_source") == "mod" and plugin.get("source_detail"):
+            return f"目录包 · {plugin['source_detail']}"
+        return label
+
+    def _core_summary_text(self) -> str:
+        """内核插件数量文案。读不到就报未启动，绝不抛异常、不影响插件列表。"""
+        try:
+            status = api_get("plugin-core/status", timeout=3)
+            plugins = status.get("plugins") if isinstance(status, dict) else None
+            if not isinstance(status, dict) or status.get("success") is False or not status.get("available"):
+                return " · 内核插件未启动"
+            return f" · 内核插件 {len(plugins) if isinstance(plugins, list) else 0} 个（在「内核插件」里管理）"
+        except Exception:
+            return " · 内核插件未启动"
+
     def _clear_filters(self):
         self.search.clear()
         self.category_filter.setCurrentIndex(0)
@@ -5725,7 +5750,7 @@ class PluginTab(QWidget):
         for plugin in self._plugins:
             row = self._rows[plugin.get("id")]["frame"]
             cat = str(plugin.get("category") or "utility")
-            searchable = " ".join(str(plugin.get(k) or "") for k in ("name", "description", "id", "status_note", "capability_label"))
+            searchable = " ".join(str(plugin.get(k) or "") for k in ("name", "description", "id", "status_note", "capability_label", "source_label", "source_detail"))
             searchable += " " + self.CATEGORIES.get(cat, cat)
             enabled = bool(plugin.get("enabled"))
             show = (not query or query in searchable.casefold()) and (not category or category == cat)
@@ -5737,7 +5762,8 @@ class PluginTab(QWidget):
             visible += int(show)
         total = len(self._plugins)
         enabled_count = sum(bool(p.get("enabled")) for p in self._plugins)
-        self.summary.setText(f"共 {total} 个  ·  已启用 {enabled_count} 个  ·  显示 {visible} 个")
+        self.summary.setText(f"共 {total} 个  ·  已启用 {enabled_count} 个  ·  显示 {visible} 个"
+                             + self._core_summary)
         self.empty.setText("没有符合条件的插件，试试其他关键词或重置筛选。" if total else "暂无插件，请确认后端已加载插件。")
         self.empty.setVisible(visible == 0)
         self.scroll.setVisible(visible > 0)
@@ -5767,6 +5793,13 @@ class PluginTab(QWidget):
             state_badge.setTextFormat(Qt.TextFormat.PlainText)
             state_badge.setStyleSheet(f'color: {ERROR if plugin.get("available") is False else ACCENT2}; font-size: 11px; padding: 3px 8px;')
             heading.addWidget(state_badge)
+        # 来源标记：内置 / 目录包（带 mod_id）/ 自定义，用来分清两条插件链
+        source_text=self._source_text(plugin)
+        source_badge=QLabel(source_text)
+        source_badge.setTextFormat(Qt.TextFormat.PlainText)
+        source_badge.setStyleSheet(f"color: {MUTED}; background: rgba(95,107,122,18); padding: 3px 8px; border-radius: 5px; font-size: 11px;")
+        source_badge.setToolTip("插件来源：内置模块 / 目录包（mod）/ 自定义（自己安装的 .py）")
+        heading.addWidget(source_badge)
         heading.addStretch()
         text.addLayout(heading)
         description = QLabel(str(plugin.get("description") or "暂无功能说明"))
@@ -6140,6 +6173,13 @@ class AboutTab(QWidget):
         self.update_notes.setVisible(False)
         box.addWidget(self.update_notes)
 
+        # 发布方没给 sha256 时，一键更新会先落到这里：把后端给的 reason 原样显示，
+        # 用户点「仍然继续」才把 allowUnverified 带上去。默认不勾，宁严勿松。
+        self.update_unverified = QCheckBox("这个版本没有发布方 sha256 校验值，仍然继续")
+        self.update_unverified.setObjectName("about_update_unverified")
+        self.update_unverified.setVisible(False)
+        box.addWidget(self.update_unverified)
+
         self.update_progress = QProgressBar()
         self.update_progress.setObjectName("about_update_progress")
         self.update_progress.setRange(0, 100)
@@ -6203,6 +6243,8 @@ class AboutTab(QWidget):
         self.btn_update_check.setEnabled(False)
         self.btn_update_apply.setEnabled(False)
         self.btn_update_apply.setText("一键更新")
+        self.update_unverified.setChecked(False)
+        self.update_unverified.setVisible(False)
         self.update_state.setText("正在检查 GitHub Release…")
         run_api_async(self, "update/check", {"repo": self.update_repo.text().strip()},
                       timeout=45, callback=self._update_checked, busy="正在检查更新…")
@@ -6286,11 +6328,30 @@ class AboutTab(QWidget):
             bits.append(f"发布时间 {published}")
         if data.get("hasUpdate"):
             self.btn_update_apply.setEnabled(True)
-            self.update_state.setText("发现新版本：" + "，".join(bits) + "。")
+            # 后端说这个 Release 拿不到发布方哈希：先摆出确认框，把原因说清楚。
+            # 用户不勾就照旧提交，后端会以 UNVERIFIED_REASON 400 拒绝，不会静默安装。
+            needs_confirm = data.get("needs_confirmation") is True
+            reason = str(data.get("confirmation_reason") or "").strip()
+            self.update_unverified.setVisible(needs_confirm)
+            self.update_unverified.setChecked(False)
+            if needs_confirm and reason:
+                self.update_unverified.setText(reason)
+            self.update_state.setText("发现新版本：" + "，".join(bits) +
+                                      ("（无法校验安装包，见下方说明）" if needs_confirm else "") + "。")
         else:
             self.update_state.setText("已经是最新版本：" + "，".join(bits) + "。")
 
     def _apply_update(self):
+        needs_confirm = self.update_unverified.isVisible()
+        allow_unverified = needs_confirm and self.update_unverified.isChecked()
+        if needs_confirm and not allow_unverified:
+            # 没有校验值又没勾选：不去请求后端，直接把选择权摆回用户面前。
+            # 让他先勾「仍然继续」，而不是让请求 400 之后再猜哪一步错了。
+            QMessageBox.warning(
+                self, "缺少校验值",
+                "这个 Release 没有发布方 sha256 校验值，无法验证安装包完整性。\n"
+                "确认要装的话，请先勾选下方「仍然继续」再点一键更新。")
+            return
         answer = QMessageBox.question(
             self, "一键更新",
             "会从 GitHub 下载最新安装包；控制台随后退出，"
@@ -6304,7 +6365,8 @@ class AboutTab(QWidget):
         self.update_state.setText("正在下载更新包…")
         self._begin_update_progress()
         run_api_async(self, "update/apply",
-                      {"repo": self.update_repo.text().strip(), "confirmed": True},
+                      {"repo": self.update_repo.text().strip(), "confirmed": True,
+                       "allowUnverified": bool(allow_unverified)},
                       timeout=900, callback=self._update_applied,
                       busy="正在下载更新包…")
 

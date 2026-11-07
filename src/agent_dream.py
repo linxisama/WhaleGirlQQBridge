@@ -7,7 +7,9 @@
 - 聚类：difflib 相似度或最长公共连续子串任一命中即同簇，簇内去重条数 = 这件事被提过几次；
 - 每簇过一道 rate 概率门，一晚最多 max_clusters 簇；
 - 账本 dream-seen.json 记住每晚看过的素材，避免同一句重复计数；
-- 只新增/更新 layer='soul' 的 dream 条目，不碰 fact/lesson/project/topic。
+- 只新增/更新 layer='soul' 的 dream 条目，不碰 fact/lesson/project/topic；
+- 按人设分流：默认人设（persona=''）读写位置与改动前完全一致，其它人设进各自的
+  data_dir/personas/<slug>/ 子目录，记忆条目带自己的 persona。
 """
 from __future__ import annotations
 
@@ -19,6 +21,11 @@ import re
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+
+try:  # 包内正常导入；被当成独立脚本跑时退化成同级模块
+    from .agent_portrait import persona_dir, persona_search, persona_slug
+except ImportError:  # pragma: no cover
+    from agent_portrait import persona_dir, persona_search, persona_slug
 
 DEFAULTS = {'enabled': False, 'lookback_days': 3, 'max_clusters': 3,
             'similarity': 0.3, 'lcs': 4, 'rate': 0.35}
@@ -105,9 +112,9 @@ def settings(config) -> dict:
     }
 
 
-def ledger_path(data_dir) -> Path:
-    """账本固定在 qq-only 数据目录下，跟消息库放同一处。"""
-    return Path(data_dir) / 'qq-only' / 'dream-seen.json'
+def ledger_path(data_dir, persona='') -> Path:
+    """账本固定在 qq-only 数据目录下，跟消息库放同一处；非默认人设进自己的目录。"""
+    return persona_dir(data_dir, persona) / 'qq-only' / 'dream-seen.json'
 
 
 # ---------- 文本工具 ----------
@@ -226,10 +233,11 @@ def _make_item(text, origin, day):
     return {'text': text, 'from': origin, 'date': str(day or '')[:10]}
 
 
-def _diary_blocks(data_dir):
+def _diary_blocks(data_dir, persona=''):
     """读 <data_dir>/日记.md，按 ## YYYY-MM-DD 分天、天内按空行分段；读不到就返回空列表。"""
     try:
-        raw = (Path(data_dir) / DIARY_NAME).read_text(encoding='utf-8', errors='ignore')
+        raw = (persona_dir(data_dir, persona) / DIARY_NAME).read_text(
+            encoding='utf-8', errors='ignore')
     except OSError:
         return []
     blocks, day, lines = [], '', []
@@ -274,13 +282,20 @@ def _diary_rows(memory):
     return blocks
 
 
-def collect(memory, data_dir, *, lookback_days=3, now=None) -> list[dict]:
-    """收集近几天可固化的素材；每项 {'text','from','date'}，from 是 diary/memory。"""
+def collect(memory, data_dir, *, lookback_days=3, now=None, persona='') -> list[dict]:
+    """收集近几天可固化的素材；每项 {'text','from','date'}，from 是 diary/memory。
+
+    日记表（diary_entries）没有 persona 列，所以非默认人设只用自己目录里的日记.md，
+    不回落到全局日记行——否则会读到别人写的那一份。
+    """
     now = time.time() if now is None else float(now)
     days = _int_in(lookback_days, 1, 30, DEFAULTS['lookback_days'])
     cutoff = _cutoff_day(now, days)
     items, seen = [], set()
-    for day, text in (_diary_blocks(data_dir) or _diary_rows(memory)):
+    blocks = _diary_blocks(data_dir, persona)
+    if not blocks and not persona_slug(persona):
+        blocks = _diary_rows(memory)
+    for day, text in blocks:
         if day < cutoff:
             continue
         item = _make_item(text, 'diary', day)
@@ -288,7 +303,7 @@ def collect(memory, data_dir, *, lookback_days=3, now=None) -> list[dict]:
             seen.add(_norm(item['text']))
             items.append(item)
     try:
-        rows = memory.search(days=days, limit=30) or []
+        rows = persona_search(memory, persona, days=days, limit=30) or []
     except Exception:
         rows = []
     for row in rows:
@@ -381,10 +396,10 @@ def _write_ledger(path, keys):
 
 # ---------- 固化 ----------
 
-def _find_dream(memory, text, similarity, lcs):
+def _find_dream(memory, text, similarity, lcs, persona=''):
     """库里同主题的 soul 条目：source='dream' 或带 dream 标签的才算自己写过的。"""
     try:
-        rows = memory.search(layer='soul', limit=30) or []
+        rows = persona_search(memory, persona, layer='soul', limit=30) or []
     except Exception:
         return None
     best, score = None, -1.0
@@ -401,12 +416,12 @@ def _find_dream(memory, text, similarity, lcs):
     return best
 
 
-def _write_cluster(memory, cluster, representative, similarity, lcs):
-    """一簇 → 一条 soul 记忆：命中同主题就更新，否则新建。"""
+def _write_cluster(memory, cluster, representative, similarity, lcs, persona=''):
+    """一簇 → 一条 soul 记忆：命中同主题就更新，否则新建；每个 persona 各一套。"""
     text = str(representative.get('text') or '')
     mentions = len({_norm(member.get('text')) for member in cluster})
     importance = min(100, 40 + 15 * mentions)
-    existing = _find_dream(memory, text, similarity, lcs)
+    existing = _find_dream(memory, text, similarity, lcs, persona)
     if existing is not None:
         older = str(existing.get('content') or '')
         longer = text if len(text) > len(older) else older
@@ -416,7 +431,7 @@ def _write_cluster(memory, cluster, representative, similarity, lcs):
         return {'id': saved['id'], 'text': longer, 'mentions': mentions,
                 'importance': max(before, importance), 'updated': True}
     saved = memory.remember(text, source='dream', layer='soul', importance=importance,
-                            channel='', persona='', tags=['dream'])
+                            channel='', persona=persona_slug(persona), tags=['dream'])
     entry = {'id': saved['id'], 'text': text, 'mentions': mentions,
              'importance': importance}
     if saved.get('merged'):
@@ -434,17 +449,19 @@ def _result(ok, reason, *, clusters=0, written=0, items=None, detail=''):
     return out
 
 
-def consolidate(memory, data_dir, *, config=None, now=None, force=False, rng=None) -> dict:
+def consolidate(memory, data_dir, *, config=None, now=None, force=False, rng=None,
+                persona='') -> dict:
     """跑一次夜间固化；任何异常都收成 reason='error'，不冒泡。"""
     try:
         conf = settings(config)
         if not conf['enabled'] and not force:
             return _result(False, 'disabled')
         now = time.time() if now is None else float(now)
-        items = collect(memory, data_dir, lookback_days=conf['lookback_days'], now=now)
+        items = collect(memory, data_dir, lookback_days=conf['lookback_days'], now=now,
+                        persona=persona)
         if not items:
             return _result(False, 'no_items')
-        path = ledger_path(data_dir)
+        path = ledger_path(data_dir, persona)
         known = _read_ledger(path)
         seen = set(known)
         fresh = [item for item in items if _key(item) not in seen]
@@ -459,7 +476,7 @@ def consolidate(memory, data_dir, *, config=None, now=None, force=False, rng=Non
         for cluster in passed[:conf['max_clusters']]:
             representative = _representative(cluster)
             entries.append(_write_cluster(memory, cluster, representative,
-                                          conf['similarity'], conf['lcs']))
+                                          conf['similarity'], conf['lcs'], persona))
             keys.append(_key(representative))
             _write_ledger(path, known + keys)
         return _result(True, 'ok', clusters=len(clusters),

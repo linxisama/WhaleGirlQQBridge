@@ -59,6 +59,7 @@ ai:
 - 用户插件复制到 %LOCALAPPDATA%\WhaleGirlQQ\data\custom_plugins\<id>\，停用不删文件。
 - 插件配置的文件字段会把文件复制到 data/plugin_uploads，不会自动上传公网。
 - 目录式 plugin_core 插件在控制台「插件 → 内核插件」安装/移除，格式见 plugin_core/README.md 和 docs/插件内核-API-v1.md。
+- 第三方插件作者看 [docs/插件交接说明.md](docs/插件交接说明.md)：两条插件链的区别、插件能拿到什么、改完怎么交。
 
 ## 测试
 
@@ -69,6 +70,10 @@ ai:
 ## 构建
 
 见 [BUILDING.md](BUILDING.md)。
+
+## 联系方式
+
+作者 林夕，QQ 2019117802；交流群「水产养殖交流群」948578157。
 
 ## 许可证
 

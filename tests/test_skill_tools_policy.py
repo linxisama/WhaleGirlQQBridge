@@ -93,6 +93,33 @@ class TempCase(unittest.TestCase):
 
 # ── 政策常量与判定 ──────────────────────────────────────────────────────────
 class TierPolicyTest(TempCase):
+    def test_builtin_spellings_share_the_same_policy(self):
+        folder = self.tmp / 'builtin-scan'
+        folder.mkdir()
+        entry = folder / 'index.js'
+        for module in ('child_process', 'path', 'fs/promises', 'net', 'vm'):
+            scans = []
+            for specifier in (module, 'node:' + module):
+                for source in ("const mod = require('%s');" % specifier,
+                               "import * as mod from '%s';" % specifier):
+                    with self.subTest(source=source):
+                        entry.write_text(source, encoding='utf-8')
+                        usage = skill_tools.ctx_api_usage(folder)
+                        self.assertEqual(usage, {'node:' + module})
+                        scans.append(skill_tools.blocked_capabilities(usage))
+            self.assertTrue(all(scan == scans[0] for scan in scans))
+            # 出网/线程/vm 与 child_process 一样归 ACCOUNTED（放行但记账），不再阻断。
+            self.assertEqual(scans[0], set())
+
+    def test_third_party_prefix_is_not_a_builtin(self):
+        folder = self.tmp / 'third-party'
+        folder.mkdir()
+        (folder / 'index.js').write_text(
+            "const cp = require('child_process_extra');", encoding='utf-8')
+        usage = skill_tools.ctx_api_usage(folder)
+        self.assertEqual(usage, {'npm:child_process_extra'})
+        self.assertEqual(skill_tools.blocked_capabilities(usage), usage)
+
     def test_default_tiers_open_t2_and_nothing_else(self):
         self.assertEqual(skill_tools.DEFAULT_TIERS, ('T1-ready', 'T2-web-fetch'))
         for tier in ('T3-extra-api', 'T4-host-source', 'T5-depends-other', 'T6-disabled'):
@@ -114,17 +141,32 @@ class TierPolicyTest(TempCase):
         self.assertEqual(skill_tools.blocked_capabilities(['fetch']), set())
         self.assertEqual(skill_tools.blocked_capabilities(['fetch'], ['web_fetch']), set())
 
-    def test_released_accounted_covers_exactly_the_two_gates(self):
+    def test_released_accounted_covers_every_accounted_gate(self):
+        # ACCOUNTED 是"放行但记账"的那一档：每个成员都要能在审计里查到 released。
         self.assertEqual(set(skill_tools.RELEASED_ACCOUNTED),
-                         {'node:child_process', 'fetch'})
+                         set(skill_tools.NODE_BUILTIN_ACCOUNTED) | {'fetch'})
         self.assertFalse(skill_tools.RELEASED_ACCOUNTED & set(skill_tools.NODE_BUILTIN_GATED))
 
     def test_gated_builtin_still_needs_its_permission(self):
-        # 闸没死：GATED 档仍然要包自己声明权限名。
-        self.assertEqual(skill_tools.blocked_capabilities(['node:net']), {'node:net'})
-        self.assertEqual(skill_tools.blocked_capabilities(['node:net'], ['network']), set())
-        self.assertEqual(skill_tools.blocked_capabilities(['node:vm'], ['network']),
-                         {'node:vm'})
+        # 闸没死：GATED 档仍然要包自己声明权限名。当前 GATED 为空（出网/线程/vm 都归了
+        # ACCOUNTED），所以这里用一个自造的 GATED 成员验证机制本身，而不是依赖具体名单。
+        original = skill_tools.GATED_BY_PERMISSION
+        try:
+            # 用假 token：真实名单里的 net/vm 已在 ACCOUNTED，走不到闸这一层。
+            skill_tools.GATED_BY_PERMISSION = dict(original, **{
+                'node:fake-gated': 'network',
+                'node:fake-thread': 'worker_threads',
+            })
+            self.assertEqual(skill_tools.blocked_capabilities(['node:fake-gated']),
+                             {'node:fake-gated'})
+            self.assertEqual(skill_tools.blocked_capabilities(['node:fake-gated'], ['network']),
+                             set())
+            self.assertEqual(skill_tools.blocked_capabilities(['node:fake-thread'], ['network']),
+                             {'node:fake-thread'})
+        finally:
+            skill_tools.GATED_BY_PERMISSION = original
+        # node:vm 已归 ACCOUNTED：声明什么权限名都不再影响它。
+        self.assertEqual(skill_tools.blocked_capabilities(['node:vm'], ['network']), set())
 
     def test_other_blockers_behave_as_before(self):
         # 未声明 web_fetch 的包：其它 ctx 成员的判定与改动前逐字一致。
@@ -159,7 +201,7 @@ class EligiblePolicyTest(TempCase):
             self.install(skill['id'])
 
     def run_eligible(self, allow=None):
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             return skill_tools.eligible_skills(allow=allow, manifest=self.manifest,
                                                runtime=self.runtime)
 
@@ -200,7 +242,7 @@ class ReleasedPlanTest(TempCase):
         self.install('plain', PLAIN_SOURCE)
 
     def plan(self):
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             return skill_tools.eligible_skills(manifest=self.manifest, runtime=self.runtime)
 
     def test_eligible_records_released_members(self):
@@ -224,7 +266,7 @@ class RegisterAuditTest(TempCase):
 
     def register(self, manifest):
         options = dict(manifest=manifest, runtime=self.runtime, **self.env)
-        with mock.patch.object(skill_tools, 'market_dir', lambda: None):
+        with mock.patch.object(skill_tools, 'market_dir', lambda runtime=None: None):
             return skill_tools.register_skills(**options)
 
     def test_register_audit_marks_released_gate(self):
@@ -248,6 +290,18 @@ class RegisterAuditTest(TempCase):
         self.assertEqual(row['tools'], ['spawner__ping'])
         self.assertEqual(sorted(tool_loop.registry_for(self.runtime).names()),
                          ['spawner__ping'])
+
+    def test_bare_builtin_keeps_registration_and_audit(self):
+        self.install('spawner', SPAWN_SOURCE.replace('node:child_process', 'child_process'))
+        result = self.register(manifest_of(skill_entry('spawner', tools=['spawner__ping'])))
+        self.assertEqual(result['failed'], [])
+        self.assertEqual(result['counts']['registeredTools'], 1)
+        self.assertEqual(result['registered'][0]['released'], ['node:child_process'])
+        rows = self.audit_rows()
+        row = next(row for row in rows if row.get('phase') == 'register')
+        self.assertEqual(row['released'], ['node:child_process'])
+        summary = next(row for row in rows if row.get('phase') == 'register-summary')
+        self.assertEqual(summary['released'], {'spawner': ['node:child_process']})
 
     def test_plain_skill_has_no_released_field(self):
         result = self.register(manifest_of(skill_entry('plain', tools=['plain__ping'])))

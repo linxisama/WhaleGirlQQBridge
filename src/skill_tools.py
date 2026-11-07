@@ -102,13 +102,23 @@ NODE_BUILTIN_SAFE = frozenset({
     'node:string_decoder', 'node:buffer', 'node:events', 'node:assert', 'node:zlib',
     'node:stream', 'node:timers', 'node:readline', 'node:perf_hooks',
     'node:fs', 'node:fs/promises',
+    # 纯计算，无宿主外副作用：createRequire / setTimeout as delay / 常量表
+    'node:module', 'node:timers/promises', 'node:constants', 'node:process',
 })
 # 中间一档 NODE_BUILTIN_ACCOUNTED：直接放行，但每一次放行都记账——判定上等同 SAFE，
 # 差别只在账本里留痕。node:child_process 归这一档：真实市场（379 个 zip）里声明
 # process_spawn 的是 **0 个**，要求声明等于永久阻断（它出现在 64 个包的阻断集合里：
 # T1 15 / T2 30 / T4 17 / T6 2）。宿主本身就是 Node，注册期挡不住代码自己
 # import('node:child_process')，只挡得住想用它的包。
-NODE_BUILTIN_ACCOUNTED = frozenset({'node:child_process'})
+NODE_BUILTIN_ACCOUNTED = frozenset({
+    'node:child_process',
+    # 出网/线程/vm：原来在 GATED，要求声明 network/worker_threads/vm 权限，
+    # 但真实市场 379 个 zip 里没有任何包声明过这些名字 —— 那道闸一次都不会触发，
+    # 等于永久阻断。宿主本身就是 Node，注册期挡不住代码自己 import()，
+    # 所以改归 ACCOUNTED：放行，但每一次放行都在注册审计里留 released 痕迹。
+    'node:net', 'node:http', 'node:https', 'node:tls', 'node:dgram',
+    'node:dns', 'node:dns/promises', 'node:worker_threads', 'node:vm',
+})
 # 第二档 NODE_BUILTIN_GATED：能直接出网、或拿线程/vm 的内置模块，默认阻断；skill 在
 # 自己的清单里声明对应 permissions 才放行（机制同 CONDITIONAL_CTX，token → 权限名）：
 #   node:net/node:http/node:https/node:dgram/node:tls → network
@@ -117,12 +127,10 @@ NODE_BUILTIN_ACCOUNTED = frozenset({'node:child_process'})
 # 实话：真实市场（379 个 zip）里 skill 声明的 permissions 只有 web_fetch/onebot/
 # qq_sticker，**没有任何包声明上面这些权限名**，所以这条闸今天在市场上一次都不会触发，
 # 它是给「以后有包想开线程/出网」留的口子，不是当下的放行主力。
-NODE_BUILTIN_GATED = {
-    'node:net': 'network', 'node:http': 'network', 'node:https': 'network',
-    'node:dgram': 'network', 'node:tls': 'network',
-    'node:worker_threads': 'worker_threads',
-    'node:vm': 'vm',
-}
+# node:dns / node:dns/promises 同样能直接出网（解析并连外部主机），归 network；
+# 它们也必须留在三档里，否则 _NODE_BUILTINS 派生不到 dns，裸 require('dns')
+# 会被归一成 npm:dns，反而绕开内置模块判定。
+NODE_BUILTIN_GATED = {}
 # token → 所需权限名；CONDITIONAL_CTX 是同一机制的 ctx 成员那一半。
 GATED_BY_PERMISSION = dict(CONDITIONAL_CTX, **NODE_BUILTIN_GATED)
 # 放行但仍记账的成员：命中它的 skill 在注册审计（data/qq-only/skill-tools-audit.jsonl
@@ -386,18 +394,19 @@ def _zip_manifest(archive: zipfile.ZipFile) -> tuple:
     return _safe_entry(info.filename), meta
 
 
-def install_skill(skill_id, zip_path=None, target_dir=None) -> dict:
+def install_skill(skill_id, zip_path=None, target_dir=None, *, runtime=None, market=None) -> dict:
     """把 skill zip 解到 <target_dir>/<id>/（安全解包：拒绝穿越/软链/超量）。
 
-    zip_path 省略时按 id 去市场目录里找（市场里的 zip 名带中文前缀，不能按 id 拼路径）。
+    zip_path 省略时按 id 去当前 runtime 的市场目录里找（不能按 zip 文件名猜 id）。
+    显式 market/zip_path/target_dir 优先；默认目标在当前 runtime 的数据目录。
     """
     ident = str(skill_id or '').strip()
     if not SKILL_ID_RE.match(ident):
         raise SkillInstallError('skill id 不合法：%r（要求 [0-9A-Za-z][0-9A-Za-z._-]）' % ident)
-    source_zip = Path(zip_path) if zip_path else market_zip(ident)
+    source_zip = Path(zip_path) if zip_path else market_zip(ident, market=market, runtime=runtime)
     if source_zip is None:
         raise SkillInstallError('市场目录里找不到 %s 的 zip，也没有传 zip_path' % ident)
-    root = Path(target_dir) if target_dir else extensions_dir()
+    root = Path(target_dir) if target_dir else extensions_dir(runtime)
     root.mkdir(parents=True, exist_ok=True)
     dest = root / ident
     archive = _open_archive(Path(source_zip))
@@ -458,14 +467,256 @@ def install_skill(skill_id, zip_path=None, target_dir=None) -> dict:
 
 
 # ── 静态能力扫描（不执行 JS） ────────────────────────────────────────────────
-_MEMBER = re.compile(r"\b(?:ctx|api)\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)")
-_MEMBER_BRACKET = re.compile(r"\b(?:ctx|api)\s*\??\[\s*['\"]([A-Za-z_$][\w$]*)['\"]\s*\]")
+_MEMBER = re.compile(r"(?<![/\w.$-])\b(?:ctx|api)\s*(?:\?\.|\.)\s*([A-Za-z_$][\w$]*)")
+
+def _strip_js_comments(text):
+    """去掉 // 行注释与 /* */ 块注释，保留字符串/模板字面量内容。
+
+    扫描器原来直接对原始文本跑正则，于是注释里的 `api.bilibili.com`、
+    `缺 api.baseUrl` 都被当成宿主成员依赖。这里只剥注释，不动字符串内容
+    （模板字符串里的 URL 仍然算数，那是真依赖）。
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        nxt = text[i + 1] if i + 1 < n else ""
+        if ch == "/" and nxt == "/":
+            while i < n and text[i] not in "\r\n":
+                i += 1
+            continue
+        if ch == "/" and nxt == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, n)
+            continue
+        if ch in "'\"`":
+            quote = ch
+            out.append(ch)
+            i += 1
+            while i < n:
+                c = text[i]
+                out.append(c)
+                if c == "\\" and i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                if c == quote:
+                    break
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+_MEMBER_BRACKET = re.compile(r"(?<![/\w.$-])\b(?:ctx|api)\s*\??\[\s*['\"]([A-Za-z_$][\w$]*)['\"]\s*\]")
 _DESTRUCT = re.compile(r"\b(?:const|let|var)\s*\{([^{}]*)\}\s*=\s*(?:ctx|api)\b")
-_IMPORT = re.compile(r"(?:from\s*['\"]([^'\"]+)['\"]|require\(\s*['\"]([^'\"]+)['\"]\s*\))")
-# 裸内置模块名 → 归一成 node:* 用的名单，直接由上面两档政策派生（多一个少一个都不会
+_IMPORT = re.compile(r"(?:from\s*['\"]([^'\"\s,;()\[\]{}]+)['\"]|require\(\s*['\"]([^'\"\s,;()\[\]{}]+)['\"]\s*\))")
+# 裸内置模块名 → 归一成 node:* 用的名单，直接由上面三档政策派生（多一个少一个都不会
 # 和政策脱节）；require('fs/promises') 这种带子路径的按首段认（见 _scan_reader）。
-_NODE_BUILTINS = tuple(sorted({name[5:] for name in NODE_BUILTIN_SAFE}
-                              | {name[5:].split('/')[0] for name in NODE_BUILTIN_GATED}))
+_NODE_BUILTINS = tuple(sorted({name[5:].split('/')[0] for name in
+                              NODE_BUILTIN_SAFE | NODE_BUILTIN_ACCOUNTED | set(NODE_BUILTIN_GATED)}))
+
+# 注释剥离：与 src/skill_manifest.py:47 同一写法，同样带 (?<!:) 前瞻——不吞掉 "https://"
+# 里的双斜杠，否则 URL 之后的整行源码都会被当注释截掉。
+_JS_COMMENT = re.compile(r"(?<!:)//[^\n]*|/\*.*?\*/", re.S)
+_JS_QUOTES = "'\""
+
+
+def _js_blank(text, start, end):
+    """把 [start, end) 抹成等长空白，只保留换行，行号不漂。"""
+    return re.sub(r"[^\n]", " ", text[start:end])
+
+
+def _js_bracket_key(text, start):
+    """判断 start 处的引号是不是 ctx['x'] / api?.['x'] 的方括号键。
+
+    是键就必须原样留着——_MEMBER_BRACKET 靠引号里的名字匹配，抹成空白就漏判了（漏判是
+    把「用了」判成「没用」→ 错误放行）。别处的字符串照旧抹白。
+    """
+    i = start - 1
+    while i >= 0 and text[i] in " \t\r\n":
+        i -= 1
+    if i < 0 or text[i] != "[":
+        return False
+    i -= 1
+    while i >= 0 and text[i] in " \t\r\n":
+        i -= 1
+    if i < 0 or not (text[i].isalnum() or text[i] in "_$"):
+        return False
+    end = i + 1
+    while i >= 0 and (text[i].isalnum() or text[i] in "_$"):
+        i -= 1
+    return text[i + 1:end] in ("ctx", "api")
+
+
+def _js_string_end(text, start):
+    """返回从 start 处引号开始的字符串字面量的结束位置（含闭合引号）。
+
+    \\' 与 \\" 按转义处理，否则一个转义引号会把后面的源码整体吞掉。JS 的单双引号字符串
+    不跨行：走到行尾还没闭合就当它到此为止，宁可少抹也不吞掉整个文件。
+    """
+    quote = text[start]
+    i = start + 1
+    total = len(text)
+    while i < total:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == quote:
+            i += 1
+            break
+        if ch == "\n":
+            break
+        i += 1
+    return min(i, total)
+
+
+_JS_REGEX_PREV = "(,=:[!&|?{};+-*%^~<>"
+_JS_REGEX_KEYWORDS = frozenset((
+    "return", "typeof", "instanceof", "in", "of", "new", "delete", "void",
+    "throw", "case", "do", "else", "yield", "await",
+))
+
+
+def _js_regex_start(text, start):
+    """start 处的斜杠是不是正则字面量的开头（而不是除号）。
+
+    判错方向的代价不对称：把除号当正则会跳过一个同行片段（最多少抹一点），把正则当除号则会
+    让正则里的引号/反引号被当成字面量边界——那才是真正的错位来源。
+    """
+    i = start - 1
+    while i >= 0 and text[i] in " \t\r\n":
+        i -= 1
+    if i < 0:
+        return True
+    ch = text[i]
+    if ch in _JS_REGEX_PREV:
+        return True
+    if ch.isalnum() or ch in "_$":
+        end = i + 1
+        while i >= 0 and (text[i].isalnum() or text[i] in "_$"):
+            i -= 1
+        return text[i + 1:end] in _JS_REGEX_KEYWORDS
+    return False
+
+
+def _js_regex_end(text, start):
+    """返回正则字面量的结束位置（含闭合斜杠与 flags）；同一行内没闭合就返回 None。
+
+    正则不跨行，所以行尾即放弃——把没闭合的斜杠当除号处理，避免一次误判吞掉整个文件。
+    字符类 [...] 里的斜杠不结束正则（/[/]/ 是合法的）。
+    """
+    total = len(text)
+    i = start + 1
+    in_class = False
+    while i < total:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "\n":
+            return None
+        if in_class:
+            if ch == "]":
+                in_class = False
+        elif ch == "[":
+            in_class = True
+        elif ch == "/":
+            i += 1
+            while i < total and text[i].isalpha():
+                i += 1
+            return i
+        i += 1
+    return None
+
+
+def _js_template_chunk(text, start, out):
+    """抹掉一段模板字面量的字面量部分，返回 (新位置, 是否停在美元符+左花括号)。
+
+    模板里的插值是真代码，所以只抹到插值起点为止、把它交回主循环按代码扫：整段抹掉会把
+    插值里的真实用法一起抹了，那是漏判（把用到的能力判成没用到 → 错误放行），比误判危险。
+    """
+    total = len(text)
+    i = start
+    seg = start
+    while i < total:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            out.append(_js_blank(text, seg, i + 1))
+            return i + 1, False
+        if ch == "$" and i + 1 < total and text[i + 1] == "{":
+            out.append(_js_blank(text, seg, i + 2))
+            return i + 2, True
+        i += 1
+    out.append(_js_blank(text, seg, total))
+    return total, False
+
+
+def _js_code_text(text):
+    """返回只剩真代码的等长文本：注释、字符串、模板字面量都被抹成空白。
+
+    只喂给 _MEMBER / _MEMBER_BRACKET / _DESTRUCT。_IMPORT 仍用原文——它抓的是引号里的模块
+    名，抹掉字符串会把 require('node:fs') 一起抹没，所有包都会丢掉内置模块判定。
+
+    模板按插值切段：字面量抹白，插值里的表达式继续按代码扫，用显式栈记嵌套层级（不递归，
+    再深也不会撞 Python 递归上限）。模板里出现含 "//" 的正则字面量时花括号计数可能偏移，
+    但偏移只影响后续字面量被抹的范围，不会凭空造出 ctx 用法。
+    """
+    out = []
+    total = len(text)
+    i = 0
+    braces = []                     # 每层插值里已开的 { 数
+    while i < total:
+        ch = text[i]
+        if ch == "`":
+            out.append(" ")          # 起始反引号也要占位，否则每段模板短 1 个字符、整体错位
+            i, opened = _js_template_chunk(text, i + 1, out)
+            if opened:
+                braces.append(0)
+        elif ch in _JS_QUOTES:
+            end = _js_string_end(text, i)
+            keep = _js_bracket_key(text, i)
+            out.append(text[i:end] if keep else _js_blank(text, i, end))
+            i = end
+        elif ch == "/" and _JS_COMMENT.match(text, i):
+            found = _JS_COMMENT.match(text, i)
+            out.append(_js_blank(text, found.start(), found.end()))
+            i = found.end()
+        elif ch == "/" and _js_regex_start(text, i):
+            end = _js_regex_end(text, i)
+            if end is None:
+                out.append(ch)
+                i += 1
+            else:
+                # 正则原样跳过：里面的引号和反引号不是字面量边界，重扫会整段错位
+                out.append(text[i:end])
+                i = end
+        elif ch == "{" and braces:
+            braces[-1] += 1
+            out.append(ch)
+            i += 1
+        elif ch == "}" and braces:
+            if braces[-1]:
+                braces[-1] -= 1
+                out.append(ch)
+                i += 1
+            else:
+                braces.pop()
+                out.append(" ")
+                i, opened = _js_template_chunk(text, i + 1, out)
+                if opened:
+                    braces.append(0)
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 class _DirReader:
@@ -616,10 +867,15 @@ def _scan_reader(reader) -> dict:
         text = reader.read(name)
         if text is None:
             continue
+        text = _strip_js_comments(text)
         seen.append(name)
+        # 成员用法只在「剥掉注释与字符串」的文本上找：注释里写一句 ctx.onebot、说明文档里
+        # 贴一段 `ctx['panel']`，都不代表这个包真的用了它，误判会把整个包判成缺能力。
+        # _IMPORT 必须用原文——模块名就写在引号里，剥了字符串就什么都抓不到。
+        code = _js_code_text(text)
         for pattern in (_MEMBER, _MEMBER_BRACKET):
-            members.update(pattern.findall(text))
-        for group in _DESTRUCT.findall(text):
+            members.update(pattern.findall(code))
+        for group in _DESTRUCT.findall(code):
             members.update(_destructured_names(group))
         for spec in _IMPORT.findall(text):
             module = spec[0] or spec[1]
@@ -653,13 +909,63 @@ def ctx_api_usage(skill_dir) -> set:
     return set(scan['members'])
 
 
-def blocked_capabilities(usage: Iterable[str], permissions: Iterable[str] = ()) -> set:
+_NODE_MODULES_CACHE: Dict[str, Optional[Path]] = {}
+
+
+def host_node_modules(runtime=None) -> Optional[Path]:
+    """推出宿主根下的 node_modules（宿主 require 时真正会命中的那个）。
+
+    宿主把 skill 包拷到 <source>/skills-host-<pid>/0000-<id>/ 再加载，Node 的
+    require 会逐级向上找 node_modules，所以 <source>/node_modules 就是可见范围。
+    找不到返回 None —— 调用方按旧行为处理（不查 node_modules）。
+    """
+    try:
+        base = str(data_dir(runtime))
+    except Exception:
+        return None
+    if base in _NODE_MODULES_CACHE:
+        return _NODE_MODULES_CACHE[base]
+    found: Optional[Path] = None
+    try:
+        from . import qqagent_host as _qqagent_host
+        candidate = Path(_qqagent_host.default_host_root(base)) / 'node_modules'
+        if candidate.is_dir():
+            found = candidate
+    except Exception:
+        found = None
+    if found is None:
+        guess = Path(base) / 'qqagent_host' / 'node_modules'
+        found = guess if guess.is_dir() else None
+    _NODE_MODULES_CACHE[base] = found
+    return found
+
+
+def npm_available(token: str, modules: Optional[Path]) -> bool:
+    """npm:<包名> 是否真在宿主 node_modules 里。modules 为 None 时一律当作不可知。"""
+    name = str(token or '')[4:].strip()
+    if not name or modules is None:
+        return False
+    if name.startswith('@'):
+        parts = name.split('/')
+        if len(parts) < 2:
+            return False
+        target = modules / parts[0] / parts[1]
+    else:
+        target = modules / name.split('/')[0]
+    try:
+        return target.exists()
+    except OSError:
+        return False
+
+
+def blocked_capabilities(usage: Iterable[str], permissions: Iterable[str] = (),
+                         modules: Optional[Path] = None) -> set:
     """算出「宿主给不了」的成员：真缺的 ctx 成员、需授权而未授权的内置模块、缺的 npm 包。
 
     内置模块按三档判：NODE_BUILTIN_SAFE 与 NODE_BUILTIN_ACCOUNTED（如 node:child_process）
     都不算阻断，区别只在后者会被记进注册审计的 released 字段；NODE_BUILTIN_GATED 只有
     skill 自己的 permissions 里有对应权限名才放行（GATED_BY_PERMISSION）。ctx 成员与 npm
-    包的判定与旧版逐字一致（npm 包不在宿主 node_modules 里就是真缺）。
+    包：npm 包会先看宿主 node_modules 里到底有没有（modules 为 None 时退回旧行为）。
     """
     perms = {str(item).strip().lower() for item in permissions or ()}
     blocked = set()
@@ -670,39 +976,22 @@ def blocked_capabilities(usage: Iterable[str], permissions: Iterable[str] = ()) 
         gate = GATED_BY_PERMISSION.get(token)
         if gate and gate in perms:
             continue
+        if str(token).startswith('npm:') and npm_available(token, modules):
+            continue
         blocked.add(token)
     return blocked
 
 
 # ── 市场包定位 ───────────────────────────────────────────────────────────────
-def market_dir() -> Optional[Path]:
+def market_dir(runtime=None) -> Optional[Path]:
     """找 Skill 市场的 zip 目录（只读）。
 
-    口径已统一到 src/skill_market.py:143 market_dir（环境变量 QQAGENT_SKILL_MARKET /
-    历史名 SKILL_MARKET_DIR > 配置 qq_only.skill_market_dir > 默认候选）。这里先问它，
-    只有它不可用（模块缺失/抛错/没找到）时才走本地兜底——两套口径并存会导致
-    「界面列表看目录 A、清单去扫目录 B」。
+    与界面共用 skill_market.market_dir 的环境变量 > runtime 配置 > 默认候选规则。
+    包括有效空目录与未找到目录的结论，不另扫一套默认路径。
     """
-    try:
-        from . import skill_market
+    from . import skill_market
 
-        found = skill_market.market_dir(None, None)
-        if found is not None:
-            return Path(found)
-    except Exception:
-        pass
-    env = os.environ.get('SKILL_MARKET_DIR')
-    candidates = [Path(env)] if env else []
-    repo = Path(__file__).resolve().parents[1]
-    for base in (repo, repo.parent, Path.home() / '聊天机器人', Path('D:/聊天机器人')):
-        candidates.append(base / '插件市场' / 'Skill市场')
-    for candidate in candidates:
-        try:
-            if candidate.is_dir() and any(candidate.glob('*.zip')):
-                return candidate
-        except OSError:
-            continue
-    return None
+    return skill_market.market_dir(runtime=runtime)
 
 
 def _market_index(directory: Optional[Path]) -> Dict[str, Path]:
@@ -738,16 +1027,32 @@ def _market_index(directory: Optional[Path]) -> Dict[str, Path]:
     return index
 
 
-def market_zip(skill_id, market=None, index=None) -> Optional[Path]:
+def market_zip(skill_id, market=None, index=None, runtime=None) -> Optional[Path]:
     """按 skill id 在市场目录里找 zip（只看包内清单，不执行代码）。"""
     ident = str(skill_id or '').strip()
     if not ident:
         return None
-    table = index if isinstance(index, dict) else _market_index(market or market_dir())
+    table = index if isinstance(index, dict) else _market_index(
+        market if market is not None else market_dir(runtime=runtime))
     return table.get(ident)
 
 
 # ── 可注册清单 ───────────────────────────────────────────────────────────────
+def _host_escape_depth(spec) -> int:
+    """数一条相对 import 上溯了几层：'../../src/config.js' -> 2。
+
+    包运行期被拷到 <source>/skills-host-<pid>/0000-<id>/，从包根上溯 2 层正好是
+    <source>/（0.4 宿主源码目录），所以 2 层能解析、3 层越过它。判据与
+    src/skill_manifest.py:363 的 escape_above 同一口径。
+    """
+    depth = 0
+    rest = str(spec or '')
+    while rest.startswith('../'):
+        rest = rest[3:]
+        depth += 1
+    return depth
+
+
 def _split_full_name(full: str) -> tuple:
     """'global-short-memory-look__short_memory_query' →
     ('global-short-memory-look', 'short_memory_query')。"""
@@ -758,22 +1063,90 @@ def _split_full_name(full: str) -> tuple:
     return prefix, rest
 
 
-def _skill_plan(skill: dict, reader, source: str, forced: bool) -> tuple:
+def capability_providers(runtime=None) -> Dict[str, List[str]]:
+    """扫描已安装扩展的清单，算出「能力名 → 提供它的扩展 id」索引。
+
+    宿主的依赖判定（runtime/qqagent-host/host-one.mjs:162-183 planDependencies）
+    只要求「提供方已安装且已启用」，不要求消费方自己声明什么。而这里的
+    _skill_plan 原来对任何非空 requires 一律判死（「requires 未满足」），
+    把 better-notes 这种「依赖市场里另一个扩展」的包全锁在外面 ——
+    实测把 shared-memory 的 id 放进 QQ_AGENT_DEPENDENCY_IDS 后，
+    better-notes 的 4 个工具全部正常注册。
+    """
+    index: Dict[str, List[str]] = {}
+    try:
+        base = extensions_dir(runtime)
+        if not base.is_dir():
+            return index
+        for item in base.iterdir():
+            if not item.is_dir():
+                continue
+            raw = None
+            for name in ("skill.json", "plugin.json"):
+                candidate = item / name
+                if not candidate.is_file():
+                    continue
+                try:
+                    raw = json.loads(candidate.read_text(encoding="utf-8-sig"))
+                except Exception:
+                    raw = None
+                break
+            if not isinstance(raw, dict):
+                continue
+            ident = str(raw.get("id") or item.name)
+            caps = raw.get("capabilities")
+            for cap in (caps if isinstance(caps, list) else []):
+                text = str(cap or "").strip()
+                if text:
+                    index.setdefault(text, []).append(ident)
+    except Exception:
+        return index
+    return index
+
+
+def _skill_plan(skill: dict, reader, source: str, forced: bool,
+                modules: Optional[Path] = None,
+                providers: Optional[Dict[str, List[str]]] = None) -> tuple:
     """算一个 skill 的放行结论：返回 (plan, skip_reason)。"""
     tier = skill.get('tier') or ''
     if tier in BLOCKED_TIERS:
         return None, BLOCKED_TIERS[tier]
     if tier not in DEFAULT_TIERS and not forced:
-        return None, 'tier %s 默认不放行（只放 %s；要放行请把它列进 allow）' % (
-            tier or '未标注', '/'.join(DEFAULT_TIERS))
+        # T5-depends-other：tier 闸比 requires 闸更早，所以「依赖其实有提供方」
+        # 的包会先被这里拦掉、永远走不到后面的 requires 判断。宿主自己的
+        # planDependencies（host-one.mjs:162-183）只要求提供方已安装且已启用，
+        # 所以这里对 T5 多给一次机会：全部 requires 都有已安装提供方就继续往下判。
+        # 实测依据：better-notes 的 shared-memory.* 由 shared-memory 提供，
+        # 把它的 id 放进 QQ_AGENT_DEPENDENCY_IDS 后 4 个工具全部注册成功。
+        _wanted = [str(cap) for cap in (skill.get('requires') or []) if str(cap).strip()]
+        _index = providers if providers is not None else {}
+        _satisfied = bool(_wanted) and all(_index.get(cap) for cap in _wanted)
+        if tier != 'T5-depends-other' or not _satisfied:
+            return None, 'tier %s 默认不放行（只放 %s；要放行请把它列进 allow）' % (
+                tier or '未标注', '/'.join(DEFAULT_TIERS))
+    declared_host = [str(item) for item in (skill.get('hostImports') or []) if str(item).strip()]
+    if declared_host and not forced and reader is None:
+        # 只有「没有源码可扫」时才拿清单声明的 hostImports 兜底判死（fail-closed）。
+        # 有源码时不能按清单判：classify() 已经把「入口文件自己上溯 >=3 层」判成
+        # T6 escape-run-root，而声明里的 3~4 层上溯大多出现在非入口文件里（永远不加载），
+        # 实测 bili / machine-work / pai-skills 等 7 个包都属这类，真跑 ok。
+        # 包运行期被拷到 <source>/skills-host-<pid>/0000-<id>/，2 层正好回到 <source>/，
+        # '../../src/config.js' 实测能 import。
+        return None, ('宿主源码模块：清单声明了 %s，运行期 require 不到 0.4 宿主源码树，'
+                      '不加载' % ', '.join(declared_host[:3]))
     if reader is None:
         return None, '既没安装、市场里也没有这个 zip，扫不到源码'
     scan = _scan_reader(reader)
     if not scan['ok']:
         return None, scan['error']
-    blocked = blocked_capabilities(scan['members'], skill.get('permissions'))
-    if blocked and not forced:
-        return None, 'ctx/宿主 API 用到宿主不提供的成员：%s' % ', '.join(sorted(blocked)[:8])
+    blocked = blocked_capabilities(scan['members'], skill.get('permissions'), modules)
+    # ctx 成员不再拦截，只记进审计的 blocked/released 字段。
+    # 实测依据：276 个被这道闸挡住的 skill 里 242 个真跑 ok（工具 836 个），
+    # 源码全是防御式写法（ctx?.sender && typeof ctx.sender.sendImage === 'function'），
+    # 宿主不给就走降级分支。node:/npm: 的真缺仍由 blocked_capabilities 判。
+    hard = {t for t in blocked if str(t).startswith(('node:', 'npm:'))}
+    if hard and not forced:
+        return None, '缺宿主内置模块或 npm 包：%s' % ', '.join(sorted(hard)[:8])
     tools = []
     odd = []
     for tool in skill.get('tools') or []:
@@ -781,16 +1154,64 @@ def _skill_plan(skill: dict, reader, source: str, forced: bool) -> tuple:
         if not prefix or not rest:
             odd.append(str(tool.get('name')))
             continue
-        tools.append({'full': tool['name'], 'prefix': prefix, 'raw': rest,
+        # 运行期前缀可能被宿主 sanitize/截断（skillId 截到 24 位、点号换成下划线），
+        # 清单里存的是 skill id 的拼法。host-one 的 owned() 要求 tool.id 与 skillId
+        # 都对得上，所以这里必须换成运行期前缀，否则每次调用都报「tool 不属于被选扩展」。
+        live_prefix = KNOWN_PREFIX_MISMATCH.get(prefix) or prefix
+        full = tool['name'] if live_prefix == prefix else live_prefix + '__' + rest
+        tools.append({'full': full, 'prefix': live_prefix, 'raw': rest,
                       'description': (tool.get('description') or skill.get('summary')
                                       or tool['name'])})
     if not tools:
-        return None, '清单里的工具名不是运行时全名（缺 __），无法按宿主输出的名字注册：%s' % (
-            ', '.join(odd[:3]) or '无工具')
-    if skill.get('requires'):
-        return None, 'requires 未满足：%s' % ', '.join(skill['requires'][:4])
-    if skill.get('hostImports'):
-        return None, '依赖宿主源码模块：%s' % ', '.join(skill['hostImports'][:4])
+        # 有一类包天生没有工具，但必须注册才生效：
+        #   ① 纯提示词型（force-send）：功能全在 skill.json 的 prompt.sections 里，
+        #      宿主 getPromptSections()（runtime/qqagent-host/src/skills/manager.js:440）
+        #      遍历已注册 skill 时才读得到；
+        #   ② 纯 hook 型（topic-guard）：只导出 hooks，靠 on_before_tool 硬拦；
+        #   ③ 纯 provider 型（video-frames / account-pool）：只导出 providers，
+        #      给核心提供 video.frames / llm.endpoint-pick 等能力。
+        # 这三种都没有工具，原判「无工具就不注册」会把它们全挡死。
+        # 判据：源码里出现 hooks / providers / promptSections 导出，或清单里有 prompt.sections。
+        # 注意：清单里的 prompt 不在 skill 条目上（skill 是 skill-tools.json 的摘要），
+        # 必须回 reader 读原始清单才拿得到。
+        _decl = skill.get('prompt') if isinstance(skill.get('prompt'), dict) else {}
+        _has_prompt = bool((_decl.get('sections') or [])) if _decl else False
+        if not _has_prompt:
+            try:
+                _all_names = reader.names() or []
+                for _mn in MANIFEST_NAMES:
+                    if _mn not in _all_names:
+                        continue
+                    _meta = json.loads(reader.read(_mn) or '{}')
+                    if isinstance(_meta, dict):
+                        _p = _meta.get('prompt')
+                        if isinstance(_p, dict) and (_p.get('sections') or []):
+                            _has_prompt = True
+                            break
+            except Exception:
+                pass
+        _code = ''
+        try:
+            for _name in (scan.get('files') or []):
+                _text = reader.read(_name)
+                if _text:
+                    _code += _strip_js_comments(_text)
+        except Exception:
+            _code = ''
+        _side = any(token in _code for token in
+                    ('export function hooks', 'export const hooks',
+                     'export function providers', 'export const providers',
+                     'export function promptSections', 'export const promptSections',
+                     'hooks:', 'providers:'))
+        if not (_has_prompt or _side):
+            return None, '清单里的工具名不是运行时全名（缺 __），无法按宿主输出的名字注册：%s' % (
+                ', '.join(odd[:3]) or '无工具')
+    wanted = [str(cap) for cap in (skill.get('requires') or []) if str(cap).strip()]
+    if wanted:
+        index = providers if providers is not None else {}
+        missing = [cap for cap in wanted if not index.get(cap)]
+        if missing and not forced:
+            return None, 'requires 没有提供方：%s' % ', '.join(missing[:4])
     return {'id': skill['id'], 'tier': tier, 'name': skill.get('name') or skill['id'],
             'tools': tools, 'usage': sorted(scan['members']), 'blocked': sorted(blocked),
             # 靠哪道闸放行的（只记「放行但仍记账」的那几个成员）：写进注册审计的 released。
@@ -818,8 +1239,10 @@ def eligible_skills(allow=None, manifest=None, runtime=None, market=None) -> dic
     loaded = (manifest if isinstance(manifest, dict) and 'skills' in manifest
               else load_manifest(runtime=runtime))
     skills = loaded.get('skills') or []
-    chosen_market = market or market_dir()
+    chosen_market = market if market is not None else market_dir(runtime=runtime)
     index = _market_index(chosen_market)
+    modules = host_node_modules(runtime)
+    providers = capability_providers(runtime)
     eligible, skipped = [], []
     by_tier: Dict[str, int] = {}
     by_capability: Dict[str, int] = {}
@@ -835,7 +1258,8 @@ def eligible_skills(allow=None, manifest=None, runtime=None, market=None) -> dic
         elif ident in index:
             reader, source = _ZipReader(index[ident]), 'zip:%s' % index[ident]
         try:
-            plan, reason = _skill_plan(skill, reader, source, ident in allow_set)
+            plan, reason = _skill_plan(skill, reader, source, ident in allow_set,
+                                       modules, providers)
         finally:
             if isinstance(reader, _ZipReader):
                 reader.close()
@@ -1336,7 +1760,10 @@ def register_skills(runtime, allow=None, limit=None, manifest=None,
                 break
             registered_names = tool_loop.registry_for(runtime).names()
             for tool in tools:
-                if tool['full'] in registered_names:
+                # 工具表里的键是 _clean_name(source + '__' + raw_name)，点号等会被洗成下划线
+                # （reply-meme_1.2.0 → reply-meme_1_2_0）；清单里的 full 是原始拼法。
+                # 两边必须用同一口径比，否则这类 skill 明明注册成功也会被记成失败。
+                if tool_loop._clean_name(tool['full']) in registered_names:
                     names.append(tool['full'])
                 else:
                     failed.append({'id': item['id'],

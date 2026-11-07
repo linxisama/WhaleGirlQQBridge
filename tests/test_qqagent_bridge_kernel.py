@@ -62,7 +62,11 @@ class EventMappingTests(unittest.TestCase):
         self.assertEqual(bridge._capability({'hookName': 'before-context'}), ('hook', 'hook', 'before-context'))
         self.assertEqual(bridge._capability({'provider': 'llm.request-params'}),
                          ('provider', 'llm.request-params', ''))
-        self.assertIsNone(bridge._capability({'provider': 'tool.guard'}))
+        # tool.guard 已在第二轮扩张里进了 ALLOWED_PROVIDERS（市场里 20 个扩展声明它，
+        # 契约只是 JSON 进 JSON 出）。这里改用真正没登记的名字，别把扩张后的能力当未知。
+        self.assertEqual(bridge._capability({'provider': 'tool.guard'}),
+                         ('provider', 'tool.guard', ''))
+        self.assertIsNone(bridge._capability({'provider': 'tool.not-a-provider'}))
         self.assertIsNone(bridge._capability({'hookName': 'not-a-hook'}))
         self.assertIsNone(bridge._capability({}))
 

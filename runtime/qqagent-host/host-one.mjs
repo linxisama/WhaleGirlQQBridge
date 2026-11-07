@@ -276,7 +276,11 @@ async function run() {
     if (!owned(tool)) throw failure('tool-not-owned', 'tool 不属于被选扩展：' + toolId);
     const availability = getToolAvailability(toolId, { runtimeContext: context });
     if (!availability.enabled) throw failure('tool-unavailable', availability.reason);
-    const toolCtx = { signal: null, log: (...args) => console.error(...args), metadata: {}, fetch: toolFetch(selected.raw), ...context, ...payload };
+    // dual-shape 的摊平顺序：payload 在前，老式 execute(payload) 仍从 ctx 读到业务参数；
+    // 可信的会话 ctx 与宿主回调在后覆盖——模型实参伪造 chatKey/senderId/target，
+    // 或把 fetch/log/metadata 换成自己的，都不生效。新式 execute(ctx, args) 的第二参
+    // 仍是原始 payload，业务参数不受影响。
+    const toolCtx = { ...payload, ...context, signal: null, log: (...args) => console.error(...args), metadata: {}, fetch: toolFetch(selected.raw) };
     toolResult = await tool.execute(toolCtx, payload);
   } else if (capability === 'hook') {
     const hookName = process.argv[5] || '';

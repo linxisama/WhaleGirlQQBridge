@@ -511,10 +511,132 @@ def _normalise(obj: dict, source: str) -> Optional[dict]:
             'description': description, 'parameters': parameters, 'source': source}
 
 
+
+
+_CONST_DECL_RE = re.compile(r'\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*')
+_OBJ_ENTRY_RE = re.compile(
+    r"""(?:([A-Za-z_$][\w$]*)|'([^']*)'|"([^"]*)")\s*:\s*(?:'([^']*)'|"([^"]*)")""")
+_MAX_CONSTS = 240
+
+
+def _js_str(value):
+    """把一个 Python 字符串写成 JS 单引号字面量。"""
+    body = str(value).replace('\\', '\\\\').replace("'", "\\'")
+    return "'" + body + "'"
+
+
+def _object_span(text, start):
+    """从 start 处的 '{' 找到配对 '}'，返回 (起, 止)；找不到返回 None。
+
+    用 _mask 判断代码区：字符串与注释里的花括号不算数。
+    """
+    try:
+        masked = _mask(text)
+    except Exception:
+        return None
+    depth = 0
+    index = start
+    total = len(masked)
+    while index < total:
+        char = masked[index]
+        if char == '{':
+            depth += 1
+        elif char == '}':
+            depth -= 1
+            if depth == 0:
+                return start, index + 1
+        index += 1
+    return None
+
+
+def _const_table(text, budget=0.02):
+    """收集 `const X = 'str'` 与 `const X = { k: 'v', ... }` 的简单字面量值。
+
+    只认一层：对象内部再引用别的常量时不追（实测市场里没有这种写法）。
+    有 20ms 预算，超了就停 —— 静态提取宁可少解，不许拖慢清单重建。
+    """
+    consts = {}
+    if not isinstance(text, str) or not text:
+        return consts
+    started = time.monotonic()
+    for index, match in enumerate(_CONST_DECL_RE.finditer(text)):
+        if index >= _MAX_CONSTS or time.monotonic() - started > budget:
+            break
+        name = match.group(1)
+        pos = match.end()
+        while pos < len(text) and text[pos] in ' \t\r\n':
+            pos += 1
+        if pos >= len(text):
+            break
+        char = text[pos]
+        if char in '\'"':
+            end = _quote_end(text, pos, char, True)
+            if end > pos:
+                consts[name] = _unquote(text[pos:end + 1])
+        elif char == '{':
+            span = _object_span(text, pos)
+            if not span:
+                continue
+            inner = {}
+            for entry in _OBJ_ENTRY_RE.finditer(text[span[0]:span[1]]):
+                key = entry.group(1) or entry.group(2) or entry.group(3)
+                val = entry.group(4) if entry.group(4) is not None else entry.group(5)
+                if key and val is not None:
+                    inner[key] = val
+            if inner:
+                consts[name] = inner
+    return consts
+
+
+def _inline_consts(text, consts):
+    """把 `id: TOOL.list` / `id: TOOL_ID` 就地换成字面量。
+
+    只替换两类位置，避免误伤声明本身：
+      1. `NAME.attr` / `NAME['attr']` → 'value'（属性引用，全文替换也安全）
+      2. `id|toolId|tool_id|key: NAME` → `...: 'value'`（标量常量）
+    """
+    out = text
+    for name, value in consts.items():
+        ident = re.escape(name)
+        if isinstance(value, dict):
+            for key, sub in value.items():
+                literal = _js_str(sub)
+                out = re.sub(r'\b%s\s*\.\s*%s\b' % (ident, re.escape(key)), literal, out)
+                out = re.sub(r"""\b%s\s*\[\s*['"]%s['"]\s*\]""" % (ident, re.escape(key)),
+                             literal, out)
+        elif isinstance(value, str):
+            out = re.sub(r'\b(id|toolId|tool_id|key)(\s*:\s*)%s\b' % ident,
+                         lambda m, lit=_js_str(value): m.group(1) + m.group(2) + lit, out)
+    return out
+
+
 def _code_tools(text: str) -> List[dict]:
+    """先走原路径；只有某个调用点解不出 id 时才建常量表、内联后重跑全文。
+
+    无条件建表会把 extract_tools 的 TIME_BUDGET 挤爆（实测 pai-skills 掉 3 个工具），
+    所以按需触发：绝大多数包一次都不用。
+    """
     found: Dict[str, dict] = {}
-    for start in _call_sites(text):
-        obj = _parse_js_object(text, start)
+    consts = None
+    work = text
+    for start in _call_sites(work):
+        obj = _parse_js_object(work, start)
+        if isinstance(obj, dict) and 'id' not in obj and consts is None:
+            consts = _const_table(text)
+            if consts:
+                work = _inline_consts(text, consts)
+                break
+        tool = _normalise(obj, 'code') if obj else None
+        if not tool:
+            continue
+        old = found.get(tool['id'])
+        if old is None or (not old['parameters'] and tool['parameters']):
+            found[tool['id']] = tool
+    if work is text:
+        return list(found.values())
+    found = {}
+    for start in _call_sites(work):
+        obj = _parse_js_object(work, start)
         tool = _normalise(obj, 'code') if obj else None
         if not tool:
             continue
@@ -668,6 +790,164 @@ def _manifest_tools(root: Path) -> List[dict]:
     return list(found.values())
 
 
+
+_LOOSE_ID = re.compile(r'^[A-Za-z0-9_-]{1,64}$')
+
+
+def _loose_object_tools(text, limit=600):
+    """兜底 A：全文找形如工具定义的对象字面量 { id, name, ..., execute }。"""
+    found = {}
+    try:
+        masked = _mask(text)
+    except Exception:
+        return found
+    index = 0
+    budget = 0
+    while True:
+        index = masked.find('{', index)
+        if index < 0 or budget >= limit:
+            break
+        budget += 1
+        obj = _parse_js_object(text, index)
+        if isinstance(obj, dict):
+            ident = obj.get('id')
+            runnable = any(k in obj for k in ('execute', 'run', 'handler'))
+            described = 'description' in obj or 'parameters' in obj
+            named = 'name' in obj
+            if (isinstance(ident, str) and _LOOSE_ID.match(ident)
+                    and (runnable or (named and described) or ('parameters' in obj and 'description' in obj))):
+                tool = _normalise(obj, 'code')
+                if tool:
+                    old = found.get(tool['id'])
+                    if old is None or (not old['parameters'] and tool['parameters']):
+                        found[tool['id']] = tool
+        index += 1
+    return found
+
+
+def _loose_array_tools(text, limit=400):
+    """兜底 B：`const defs = [['id', '名称', '描述', {...}], ...]` 这类表驱动定义。
+
+    真例：admin-mute / qq-self 用
+        for (const [id, name, description, properties] of defs) api.registerTool({ id, ... })
+    对象的 id 是解构变量，静态解析看不到字面量，只能从 defs 数组回填。
+    """
+    found = {}
+    for match in re.finditer(r'(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*\[', text):
+        start = match.end() - 1
+        try:
+            masked = _mask(text)
+        except Exception:
+            return found
+        depth = 0
+        index = start
+        end = -1
+        while index < len(masked):
+            char = masked[index]
+            if char == '[':
+                depth += 1
+            elif char == ']':
+                depth -= 1
+                if depth == 0:
+                    end = index
+                    break
+            index += 1
+        if end < 0:
+            continue
+        cursor = start + 1
+        count = 0
+        while cursor < end and count < limit:
+            while cursor < end and masked[cursor] in ' \t\r\n,':
+                cursor += 1
+            if cursor >= end or masked[cursor] != '[':
+                break
+            cursor += 1
+            count += 1
+            fields = []
+            for _ in range(2):
+                while cursor < end and masked[cursor] in ' \t\r\n,':
+                    cursor += 1
+                if cursor < end and masked[cursor] in '\'"`':
+                    quote = masked[cursor]
+                    close = text.find(quote, cursor + 1)
+                    if close < 0:
+                        break
+                    fields.append(text[cursor + 1:close])
+                    cursor = close + 1
+                else:
+                    break
+            if len(fields) == 2 and _LOOSE_ID.match(fields[0]) and fields[1].strip():
+                tool = _normalise({'id': fields[0], 'name': fields[1]}, 'code')
+                if tool and tool['id'] not in found:
+                    found[tool['id']] = tool
+            # 跳到下一个顶层元素
+            depth = 1
+            while cursor < end:
+                char = masked[cursor]
+                if char in '[{(':
+                    depth += 1
+                elif char in ']})':
+                    depth -= 1
+                    if depth == 0:
+                        cursor += 1
+                        break
+                cursor += 1
+    return found
+
+
+def _loose_call_tools(text, limit=200):
+    """兜底 C：`register('id', '名称', '描述', {...})` 这类位置参数注册函数。
+
+    真例：mooncell 用 const register = (id, name, description, parameters, method) => api.registerTool({id, ...})。
+    """
+    found = {}
+    for match in re.finditer(r'\b([A-Za-z_$][\w$]*)\s*\(\s*([\'"])([A-Za-z0-9_-]{1,64})\2\s*,\s*([\'"])', text):
+        name = match.group(1)
+        if not re.search(r'register|tool', name, re.I):
+            continue
+        ident = match.group(3)
+        start = match.start(4) + 1
+        close = text.find(match.group(4), start)
+        if close < 0 or close - start > 200:
+            continue
+        label = text[start:close].strip()
+        if not label:
+            continue
+        tool = _normalise({'id': ident, 'name': label}, 'code')
+        if tool and tool['id'] not in found:
+            found[tool['id']] = tool
+        if len(found) >= limit:
+            break
+    return found
+
+
+def _loose_tools(text):
+    """兜底：严格路径一个工具都没解出来时，用三种宽松扫描合并。"""
+    merged = {}
+    for table in (_loose_object_tools(text), _loose_array_tools(text), _loose_call_tools(text)):
+        for key, value in table.items():
+            if key not in merged:
+                merged[key] = value
+    return list(merged.values())
+
+
+def _loose_from_dir(root):
+    """对一个包做兜底扫描（只在严格路径返回空时调用）。"""
+    found = {}
+    try:
+        for path in sorted(root.rglob('*.js')):
+            if path.stat().st_size > 400000:
+                continue
+            text = _read_text(path, MAX_FILE_BYTES)
+            if not text:
+                continue
+            for tool in _loose_tools(text):
+                old = found.get(tool['id'])
+                if old is None or (not old['parameters'] and tool['parameters']):
+                    found[tool['id']] = tool
+    except Exception as exc:
+        _log.debug('loose scan failed on %s: %s', root, exc)
+    return list(found.values())
 def extract_tools(extension_dir, entry_files=None) -> Dict[str, dict]:
     """静态提取一个包里的工具定义：{tool_id: {id,name,description,parameters,source}}。
 
@@ -707,6 +987,16 @@ def extract_tools(extension_dir, entry_files=None) -> Dict[str, dict]:
                 result[tool['id']] = merged
     except Exception as exc:
         _log.debug('extract_tools failed on %s: %s', extension_dir, exc)
+    if not result:
+        # 兜底：严格路径一个工具都没解出来时，用宽松扫描再试一次。
+        # 只在「空结果」时触发，正常包完全不受影响（实测 331 包工具数不变）。
+        try:
+            loose_root = Path(extension_dir)
+            if loose_root.is_dir():
+                for tool in _loose_from_dir(loose_root):
+                    result.setdefault(tool['id'], tool)
+        except Exception as exc:
+            _log.debug('loose scan failed on %s: %s', extension_dir, exc)
     return result
 
 

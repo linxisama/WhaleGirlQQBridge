@@ -4,6 +4,7 @@ let busy = false, dirty = false;
 let currentPlugin = null;  // 当前正在编辑的插件
 let allPlugins = [];       // 所有插件数据缓存
 let polling = true;
+let heartLoaded = false;   // 心情面板 iframe 首次打开才加载
 
 async function showCompatMode() {
   try {
@@ -40,13 +41,27 @@ async function api(path, body) {
 function switchTab(name) {
   document.querySelectorAll('.tab-btn').forEach((b, i) => {
     const panels = ['settings', 'plugins', 'persona', 'messages', 'logs'];
-    b.classList.toggle('active', panels[i] === name);
+    // 带 data-tab 的按钮自己声明页签名（新标签不用改这张下标表），老按钮仍按下标对齐。
+    const key = (b.dataset && b.dataset.tab) ? b.dataset.tab : panels[i];
+    b.classList.toggle('active', key === name);
   });
   document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
   $('tab-' + name).classList.add('active');
   if (name === 'plugins') loadPlugins();
   if (name === 'persona') loadPersona();
+  if (name === 'heart') enterHeart();
   if (name === 'logs') enterLogs(); else exitLogs();
+}
+
+// ── Heart ─────────────────────────────────────────────────────────────────────
+function enterHeart() {
+  const frame = $('heart-frame');
+  if (!frame) return;
+  // 首次进入才请求 /heart，避免控制台每次打开都多一次面板渲染。
+  if (!heartLoaded) {
+    heartLoaded = true;
+    frame.src = '/heart?embed=1';
+  }
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -663,6 +678,14 @@ function startLogAuto() {
 
 function enterLogs() { loadLogs(); startLogAuto(); }
 function exitLogs() { stopLogAuto(); }
+
+if ($('heart-reload')) $('heart-reload').addEventListener('click', () => {
+  const frame = $('heart-frame');
+  if (!frame) return;
+  heartLoaded = true;
+  // 加时间戳绕过缓存，面板里的 fetch 本身是 no-store 的。
+  frame.src = '/heart?embed=1&t=' + Date.now();
+});
 
 if ($('log-level')) $('log-level').addEventListener('change', loadLogs);
 if ($('log-source')) $('log-source').addEventListener('change', loadLogs);

@@ -135,7 +135,8 @@ export class SendQueue {
    */
   async sendTextBatch(chatKey, messages, options = {}) {
     const [kind, id] = String(chatKey).split(':');
-    if (kind !== 'group' && kind !== 'private') throw new Error(`非法会话 key：${chatKey}`);
+    // local：控制台里的「本地聊天」会话，不经过 OneBot，直接落库给界面渲染。
+    if (kind !== 'group' && kind !== 'private' && kind !== 'local') throw new Error(`非法会话 key：${chatKey}`);
     const list = Array.isArray(messages) ? messages : [messages];
     if (!list.length) throw new Error('消息列表为空');
     const hardSplitAt = Number(getConfig().send?.hardSplitAt) || 0;
@@ -156,21 +157,25 @@ export class SendQueue {
     for (let i = 0; i < parts.length; i++) {
       const text = parts[i];
       const isLast = i === parts.length - 1;
-      const gap = this.#gap(text, isLast);
+      // 本地会话不需要拟人化的发送间隔（那是给 QQ 防刷屏用的）
+      const gap = kind === 'local' ? 0 : this.#gap(text, isLast);
       promises.push(chain(async () => {
-        this.#checkRate(chatKey);
+        if (kind !== 'local') this.#checkRate(chatKey);
         if (gap > 0) await sleep(gap);
         // 发送去重：窗口期内 identical 文本跳过（防模型重复调用/超时重试造成的重复发言）
         if (this.#isDuplicate(chatKey, text)) {
           console.warn(`[sender] 跳过重复消息（${this.#dedupeWindow()}ms 内已发过相同内容）：${String(text).slice(0, 30)}`);
           return { text, messageId: null, at: formatClockTime(Date.now()), deduped: true };
         }
-        const data = await this.onebot.sendText(kind, id, text, {
-          replyToMessageId: i === 0 ? options.replyToMessageId : null, // 引用挂在第一条上：回的就是那条
-          atUserId: i === 0 ? options.atUserId : null
-        });
-        this.#markSent(chatKey, text);   // 只有 OneBot 成功返回后才记入去重窗口
         const ts = Date.now();
+        const data = kind === 'local'
+          // 本地会话：不调 OneBot，只给一个本地 message_id 让上层照常记账
+          ? { message_id: `local-${ts}-${i}` }
+          : await this.onebot.sendText(kind, id, text, {
+            replyToMessageId: i === 0 ? options.replyToMessageId : null, // 引用挂在第一条上：回的就是那条
+            atUserId: i === 0 ? options.atUserId : null
+          });
+        this.#markSent(chatKey, text);   // 只有 OneBot 成功返回后才记入去重窗口
         this.store.appendSelf(chatKey, { text, ts, mid: data?.message_id ?? null });
         this.onSent?.({ chatKey, text, messageId: data?.message_id ?? null });
         return { text, messageId: data?.message_id ?? null, at: formatClockTime(ts) };
@@ -199,6 +204,11 @@ export class SendQueue {
   /** 发送一个收藏表情（独立气泡）。 */
   sendSticker(chatKey, sticker, options = {}) {
     const [kind, id] = String(chatKey).split(':');
+    // 本地会话没有协议端可发图：降级成文字标记，别让模型以为发送失败
+    if (kind === 'local') {
+      const name = String(sticker?.name || sticker?.desc || '').trim();
+      return this.sendTextBatch(chatKey, [name ? `[表情] ${name}` : '[表情]'], options);
+    }
     const chain = this.#chain(chatKey);
     return chain(async () => {
       this.#checkRate(chatKey);
@@ -279,6 +289,7 @@ export class SendQueue {
    */
   sendImage(chatKey, img, options = {}) {
     const [kind, id] = String(chatKey).split(':');
+    if (kind === 'local') return this.sendTextBatch(chatKey, ['[图片]'], options);
     const chain = this.#chain(chatKey);
     const url = String(img?.url ?? '').trim();
     const dataUrl = String(img?.dataUrl ?? '').trim();
@@ -347,6 +358,10 @@ export class SendQueue {
    */
   sendMedia(chatKey, segments, options = {}) {
     const [kind, id] = String(chatKey).split(':');
+    if (kind === 'local') {
+      const label = String(options.label || '[媒体]');
+      return this.sendTextBatch(chatKey, [label], options);
+    }
     if (kind !== 'group' && kind !== 'private') return Promise.reject(new Error(`非法会话 key：${chatKey}`));
     const segs = (Array.isArray(segments) ? segments : []).filter((s) => s && s.type);
     if (!segs.length) return Promise.reject(new Error('媒体段为空'));

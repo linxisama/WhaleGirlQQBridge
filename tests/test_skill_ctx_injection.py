@@ -2,9 +2,10 @@
 
 三部分：
 1. 纯函数：context_env / runtime_tool_context 的过滤与降级；
-2. 契约：两份 host-one.mjs 都有这个通道、合并顺序里 payload 最后；
+2. 契约：两份 host-one.mjs 都有这个通道、合并顺序里可信 ctx 与宿主回调在 payload 之后
+   （payload 先摊平，模型实参伪造不了会话身份，也换不掉宿主回调）；
 3. 真进程：真 node + 真 host-one.mjs + 夹具 skill，证明注入前 ctx.chatKey 是 undefined、
-   注入后拿到真值、且 payload 依然优先级最高。
+   注入后拿到真值、伪造的实参一个都不生效、业务参数照旧透传。
 """
 import asyncio
 import json
@@ -39,9 +40,15 @@ INDEX_JS = """export function setup(api) {
     chatKey: ctx && ctx.chatKey !== undefined ? String(ctx.chatKey) : null,
     kind: ctx && ctx.kind !== undefined ? String(ctx.kind) : null,
     senderId: ctx && ctx.senderId !== undefined ? String(ctx.senderId) : null,
+    target: ctx && ctx.target !== undefined ? String(ctx.target) : null,
     probe: ctx && ctx.probe !== undefined ? String(ctx.probe) : null,
+    argsProbe: args && args.probe !== undefined ? String(args.probe) : null,
     hasChatKey: Boolean(ctx && Object.prototype.hasOwnProperty.call(ctx, 'chatKey')),
     logType: ctx ? typeof ctx.log : 'ctx-missing',
+    fetchType: ctx ? typeof ctx.fetch : 'ctx-missing',
+    metadataKeys: ctx && ctx.metadata && typeof ctx.metadata === 'object'
+      ? Object.keys(ctx.metadata).join(',') : 'not-object',
+    signalIsNull: Boolean(ctx && ctx.signal === null),
   }; } });
 }
 """
@@ -364,13 +371,14 @@ class HostScriptChannelTest(unittest.TestCase):
             self.assertIn('function hostContext()', text)
             # 解析失败必须安全降级
             self.assertIn('catch { return {}; }', text)
-            # 合并顺序：环境 ctx 在 payload 之前（payload 是本次实参，优先级最高）
+            # 合并顺序（P1-2）：payload 先摊平，环境 ctx 与宿主回调在后覆盖，
+            # 所以模型实参伪造的 chatKey 会被环境里的真值压掉。
             ctx_line = [line for line in text.splitlines() if 'const toolCtx =' in line][0]
             # hostContext is read once before availability and execution.
             context_source = '...hostContext()' if '...hostContext()' in ctx_line else '...context'
             if context_source == '...context':
                 self.assertIn('const context = hostContext();', text)
-            self.assertLess(ctx_line.index(context_source), ctx_line.index('...payload'))
+            self.assertLess(ctx_line.index('...payload'), ctx_line.index(context_source))
 
 
 # ── 真进程 ───────────────────────────────────────────────────────────────────
@@ -421,12 +429,72 @@ class RealProcessInjectionTest(unittest.TestCase):
         self.assertIsNone(value['kind'])
         self.assertFalse(value['hasChatKey'])
 
-    def test_payload_still_wins_over_injected_context(self):
-        result = self.call({'chatKey': 'from-env'}, {'chatKey': 'from-payload', 'probe': 'p'})
+    def test_bare_builtin_loads_and_executes_without_spawning(self):
+        source = """import { execSync } from 'child_process';
+export function setup(api) {
+  api.registerTool({ id: 'echo_ctx', name: 'builtin probe',
+    parameters: { type: 'object', properties: {} },
+    async execute() { return { execType: typeof execSync }; }
+  });
+}
+"""
+        (self.extension / 'index.js').write_text(source, encoding='utf-8')
+        usage = skill_tools.ctx_api_usage(self.extension)
+        self.assertIn('node:child_process', usage)
+        self.assertEqual(skill_tools.blocked_capabilities(usage), set())
+        result = self.call()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['result'], {'execType': 'function'})
+
+    def test_forged_identity_in_arguments_cannot_override_the_turn(self):
+        """P1-2 负例：实参里伪造 chatKey/kind/senderId/target，压不掉本轮注入的可信值。"""
+        result = self.call(
+            {'chatKey': 'group:12345', 'kind': 'group', 'senderId': '999', 'target': 'group:12345'},
+            {'chatKey': 'group:666', 'kind': 'private', 'senderId': '666', 'target': 'private:666',
+             'probe': 'p'})
         self.assertTrue(result['ok'], result)
         value = result['result']
-        self.assertEqual(value['chatKey'], 'from-payload')
+        self.assertEqual(value['chatKey'], 'group:12345')
+        self.assertEqual(value['kind'], 'group')
+        self.assertEqual(value['senderId'], '999')
+        self.assertEqual(value['target'], 'group:12345')
+        # 业务参数不受影响：第二参拿得到，摊平后的 ctx 也读得到。
+        self.assertEqual(value['argsProbe'], 'p')
         self.assertEqual(value['probe'], 'p')
+
+    def test_forged_host_callbacks_are_replaced_by_the_host_ones(self):
+        """实参里塞 fetch/log/metadata/signal 的数据换不掉宿主回调。"""
+        result = self.call({'chatKey': 'group:12345'},
+                           {'fetch': 'evil', 'log': 'evil', 'metadata': {'forged': True},
+                            'signal': 'evil'})
+        self.assertTrue(result['ok'], result)
+        value = result['result']
+        self.assertEqual(value['fetchType'], 'function')
+        self.assertEqual(value['logType'], 'function')
+        self.assertEqual(value['metadataKeys'], '')
+        self.assertTrue(value['signalIsNull'], value)
+
+    def test_absent_trusted_field_is_filled_from_arguments(self):
+        """宿主没有该字段时没有可信值可保护，实参的会留下——既定边界，不是回归。"""
+        result = self.call(None, {'chatKey': 'from-payload'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['result']['chatKey'], 'from-payload')
+
+    def test_single_arg_extension_still_reads_arguments_from_ctx(self):
+        """老式 execute(payload) 靠摊平读参数，改顺序之后仍然读得到。"""
+        source = """export function setup(api) {
+  api.registerTool({ id: 'echo_ctx', name: 'old style',
+    parameters: { type: 'object', properties: {} },
+    async execute(payload) {
+      return { probe: payload && payload.probe !== undefined ? String(payload.probe) : null };
+    }
+  });
+}
+"""
+        (self.extension / 'index.js').write_text(source, encoding='utf-8')
+        result = self.call(None, {'probe': 'old-style'})
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(result['result'], {'probe': 'old-style'})
 
     def test_parent_process_never_sees_the_variable_during_a_real_call(self):
         # 真 node：调用期间另起线程高频采样父进程环境，一次都不该出现这个键。

@@ -17,7 +17,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from src import skill_market
+from src import extension_registry, skill_market
 
 
 def _write_zip(path, entries):
@@ -57,14 +57,28 @@ def _tier_one_zip(path, ident='demo-skill', manifest='skill.json', body=_T1_BODY
     return path
 
 
+def _snapshot_skill(ident, tier, tools, **extra):
+    """清单里一条 skill 记录（字段对齐 skill_manifest._skill_entry 的输出）。"""
+    entry = {'id': ident, 'name': ident, 'version': '1.0.0', 'tier': tier,
+             'tierReason': 'clean', 'tools': [{'name': name} for name in tools],
+             'permissions': [], 'requires': [], 'hostImports': [], 'external': [],
+             'usage': [], 'entry': 'index.js',
+             'source': {'kind': 'market', 'path': ident + '.zip'}}
+    entry.update(extra)
+    return entry
+
+
 class _Case(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
         self.runtime = types.SimpleNamespace(data_root=str(self.root))
         self.extensions = self.root / 'data' / 'qq-only' / 'skill_extensions'
+        self.manifest = self.root / 'data' / 'qq-only' / 'skill-tools.json'
         self.market = self.root / 'market'
         self.market.mkdir()
+        # extension_registry 的扫描缓存是模块级的，跨用例会串味。
+        extension_registry.invalidate()
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -74,6 +88,23 @@ class _Case(unittest.TestCase):
             return sorted(os.listdir(path))
         except OSError:
             return []
+
+    def _seed_manifest(self, skills, **meta):
+        """在 runtime 数据目录里放一份清单快照（模拟上一次构建的结论）。"""
+        self.manifest.parent.mkdir(parents=True, exist_ok=True)
+        payload = {'meta': dict({'version': 1, 'generator': 'src/skill_manifest.py',
+                                 'writtenAt': 1700000000, 'marketDir': 'D:/old-market',
+                                 'overrides': []}, **meta),
+                   'skills': skills,
+                   'stats': {'skillsTotal': len(skills), 'toolsTotal': 0,
+                             'zipsInMarketDir': 7,
+                             'tierCounts': {}, 'tierToolCounts': {},
+                             'skillsWithExternalHosts': 0, 'distinctExternalHosts': 0}}
+        self.manifest.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')
+        return payload
+
+    def _read_manifest(self):
+        return json.loads(self.manifest.read_text(encoding='utf-8'))
 
 
 class MarketDirTests(_Case):
@@ -368,15 +399,30 @@ class InstallTests(_Case):
         self.assertFalse((self.extensions / 'demo-skill').exists())
         self.assertEqual(self._listing(self.extensions), [])
 
-    def test_tier_from_manifest_snapshot_when_known(self):
-        snapshot = skill_market._snapshot_index()
-        if 'wiki-query' not in snapshot:
-            self.skipTest('清单快照里没有 wiki-query')
-        zip_path = _good_zip(self.market / 'wiki-query.zip', 'wiki-query')
+    def test_fresh_package_beats_stale_snapshot(self):
+        """刚装进去的包必须压过旧快照：旧快照说 T6 无工具，新包自己就是 T1。"""
+        self._seed_manifest([_snapshot_skill('demo-skill', 'T6-disabled', [])])
+        zip_path = _tier_one_zip(self.market / 'demo-skill.zip', 'demo-skill')
         result = skill_market.install(zip_path, runtime=self.runtime)
         self.assertTrue(result['ok'], result['error'])
-        self.assertEqual(result['tier'], snapshot['wiki-query']['tier'])
-        self.assertEqual(result['tools'], snapshot['wiki-query']['tools'])
+        self.assertEqual(result['tier'], 'T1-ready')
+        self.assertEqual(result['tools'], ['demo-skill__demo'])
+        item = skill_market.list_installed(runtime=self.runtime)['items'][0]
+        self.assertEqual(item['tier'], 'T1-ready')
+        self.assertEqual(item['tools'], ['demo-skill__demo'])
+
+    def test_snapshot_only_fills_in_when_package_cannot_be_classified(self):
+        """快照只做兜底：包自己分不出层时才拿旧结论顶上。"""
+        self._seed_manifest([_snapshot_skill('demo-skill', 'T1-ready', ['demo-skill__demo'])])
+        dest = self.extensions / 'demo-skill'
+        dest.mkdir(parents=True)
+        tier, tools = skill_market._installed_placement(
+            dest, 'demo-skill', {}, self.runtime)
+        self.assertEqual((tier, tools), ('T1-ready', ['demo-skill__demo']))
+        tier, tools = skill_market._installed_placement(
+            dest, 'demo-skill', {'tier': 'T2-web-fetch',
+                                 'tools': [{'name': 'demo-skill__fetch'}]}, self.runtime)
+        self.assertEqual((tier, tools), ('T2-web-fetch', ['demo-skill__fetch']))
 
 
 class UninstallTests(_Case):
@@ -409,6 +455,90 @@ class UninstallTests(_Case):
                                  runtime=self.runtime)
         skill_market.uninstall('drop-skill', runtime=self.runtime)
         self.assertEqual(self._listing(self.extensions), ['keep-skill'])
+
+
+class ManifestSyncTests(_Case):
+    """装/覆盖/卸载之后，清单与扩展发现缓存里那个 id 的结论必须跟着变。"""
+
+    def test_install_writes_entry_and_keeps_other_skills(self):
+        other = _snapshot_skill('other-skill', 'T2-web-fetch', ['other-skill__fetch'],
+                                tierReason='web_fetch', entry='main.js')
+        self._seed_manifest([other])
+        zip_path = _tier_one_zip(self.market / 'demo-skill.zip', 'demo-skill')
+        result = skill_market.install(zip_path, runtime=self.runtime)
+        self.assertTrue(result['ok'], result['error'])
+        self.assertTrue(result['manifestSynced'], result)
+        self.assertEqual(result['manifestAction'], 'added')
+        self.assertEqual(result['manifestPath'], str(self.manifest))
+        data = self._read_manifest()
+        self.assertEqual([item['id'] for item in data['skills']],
+                         ['demo-skill', 'other-skill'])
+        entry = data['skills'][0]
+        self.assertEqual(entry['tier'], 'T1-ready')
+        self.assertEqual(entry['tools'], [{'name': 'demo-skill__demo',
+                                           'description': 'demo', 'hasSchema': False}])
+        self.assertEqual(entry['source']['kind'], 'installed')
+        # 别的 skill 逐字节不动，市场侧统计沿用上次全量构建的结论。
+        self.assertEqual(data['skills'][1], other)
+        self.assertEqual(data['stats']['zipsInMarketDir'], 7)
+        self.assertEqual(data['meta']['marketDir'], 'D:/old-market')
+
+    def test_reinstall_replaces_stale_entry(self):
+        self._seed_manifest([_snapshot_skill('demo-skill', 'T6-disabled', [])])
+        zip_path = _tier_one_zip(self.market / 'demo-skill.zip', 'demo-skill')
+        self.assertTrue(skill_market.install(zip_path, runtime=self.runtime)['ok'])
+        data = self._read_manifest()
+        self.assertEqual(len(data['skills']), 1)
+        self.assertEqual(data['skills'][0]['tier'], 'T1-ready')
+        self.assertEqual(data['skills'][0]['tools'][0]['name'], 'demo-skill__demo')
+
+    def test_absent_or_broken_manifest_is_left_alone(self):
+        """没有清单就没有过时结论可失效：这里不造半份清单，重建交给 ensure_manifest。"""
+        zip_path = _tier_one_zip(self.market / 'demo-skill.zip', 'demo-skill')
+        result = skill_market.install(zip_path, runtime=self.runtime)
+        self.assertTrue(result['ok'], result['error'])
+        self.assertEqual(result['manifestAction'], 'absent')
+        self.assertFalse(self.manifest.exists())
+        self.manifest.parent.mkdir(parents=True, exist_ok=True)
+        self.manifest.write_text('{not json', encoding='utf-8')
+        result = skill_market.install(zip_path, runtime=self.runtime, force=True)
+        self.assertTrue(result['ok'], result['error'])
+        self.assertEqual(result['manifestAction'], 'broken')
+        self.assertEqual(self.manifest.read_text(encoding='utf-8'), '{not json')
+
+    def test_uninstall_removes_entry_and_keeps_siblings(self):
+        self._seed_manifest([_snapshot_skill('keep-skill', 'T1-ready', ['keep-skill__demo']),
+                             _snapshot_skill('drop-skill', 'T1-ready', ['drop-skill__demo'])])
+        for ident in ('keep-skill', 'drop-skill'):
+            skill_market.install(_tier_one_zip(self.market / (ident + '.zip'), ident),
+                                 runtime=self.runtime)
+        result = skill_market.uninstall('drop-skill', runtime=self.runtime)
+        self.assertTrue(result['ok'], result['error'])
+        self.assertEqual(result['manifestAction'], 'removed')
+        data = self._read_manifest()
+        self.assertEqual([item['id'] for item in data['skills']], ['keep-skill'])
+        self.assertEqual(data['stats']['skillsTotal'], 1)
+
+    def test_registry_cache_is_invalidated_after_install(self):
+        zip_path = _tier_one_zip(self.market / 'demo-skill.zip', 'demo-skill')
+        with mock.patch.object(skill_market.extension_registry, 'invalidate') as spy:
+            installed = skill_market.install(zip_path, runtime=self.runtime)
+        self.assertTrue(installed['ok'], installed['error'])
+        self.assertTrue(installed['registryInvalidated'])
+        self.assertEqual(spy.call_count, 1)
+        with mock.patch.object(skill_market.extension_registry, 'invalidate') as spy:
+            removed = skill_market.uninstall('demo-skill', runtime=self.runtime)
+        self.assertTrue(removed['ok'], removed['error'])
+        self.assertEqual(spy.call_count, 1)
+
+    def test_manifest_failure_does_not_fail_the_install(self):
+        zip_path = _tier_one_zip(self.market / 'demo-skill.zip', 'demo-skill')
+        with mock.patch.object(skill_market, '_skill_manifest', return_value=None):
+            result = skill_market.install(zip_path, runtime=self.runtime)
+        self.assertTrue(result['ok'], result['error'])
+        self.assertFalse(result['manifestSynced'])
+        self.assertEqual(result['manifestError']['code'], 'no-manifest')
+        self.assertTrue((self.extensions / 'demo-skill' / 'index.js').is_file())
 
 
 class SummaryTests(_Case):

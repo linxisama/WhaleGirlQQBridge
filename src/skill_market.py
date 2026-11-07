@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import uuid
 import zipfile
 from pathlib import Path
@@ -640,18 +641,134 @@ def _swap_into_place(package, dest, ident) -> bool:
     return replaced
 
 
-def _installed_placement(directory, ident, detail=None, runtime=None) -> tuple:
-    """落位后的 (tier, tools)：先看清单快照，取不到再静态分层，都没有就留空。"""
-    entry = _snapshot_index(runtime).get(ident) or {}
+def _entry_for(ident, directory) -> dict:
+    """按清单口径给**这一个**已安装目录算条目（tier/tools 都带 id 前缀）；失败返回 {}。"""
+    module = _skill_manifest()
+    if module is None:
+        return {}
+    try:
+        return dict(module._skill_entry(ident, directory, 'installed') or {})
+    except Exception:
+        return {}
+
+
+def _installed_placement(directory, ident, detail=None, runtime=None, entry=None) -> tuple:
+    """落位后的 (tier, tools)：先认这次装进去的包，都取不到才用清单快照兜底。
+
+    顺序不能反：快照是上一次构建时的结论，刚覆盖的包可能换了层级与工具名，
+    拿旧快照回填等于把过时结论冒充新包的分层（旧包 T1、新包其实 T6 时尤其危险）。
+    """
+    if entry is None:
+        entry = _entry_for(ident, directory)
     tier = str(entry.get('tier') or '')
-    tools = list(entry.get('tools') or [])
-    if tier and tools:
-        return tier, tools
+    # no-manifest 只说明这个目录里没清单，不构成对包的分层结论，别拿它顶掉 detail。
+    if tier and entry.get('tierReason') != 'no-manifest':
+        return tier, _tool_names(entry.get('tools'))
     if detail is None:
         detail = _classify_detail(directory)
-    extra_tools = [str(tool.get('name')) for tool in (detail.get('tools') or [])
-                   if isinstance(tool, dict) and str(tool.get('name') or '')]
-    return tier or str(detail.get('tier') or ''), tools or extra_tools
+    detail = detail or {}
+    tier = str(detail.get('tier') or '')
+    tools = _tool_names(detail.get('tools'))
+    if tier:
+        return tier, tools
+    snapshot = _snapshot_index(runtime).get(ident) or {}
+    return str(snapshot.get('tier') or ''), tools or list(snapshot.get('tools') or [])
+
+
+# ── 清单失效（按单个 ID 精确更新，不整份重建） ──────────────────────────────
+def _skill_manifest():
+    """冻结的 src/skill_manifest.py：只调它已有的函数，不改它。"""
+    try:
+        from . import skill_manifest
+    except ImportError:
+        try:
+            from src import skill_manifest
+        except ImportError:
+            return None
+    return skill_manifest
+
+
+def _manifest_load(target):
+    """读旧清单原文：('absent'|'broken'|'ok', dict|None)。"""
+    try:
+        if not Path(target).is_file():
+            return 'absent', None
+        data = json.loads(Path(target).read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError, UnicodeDecodeError):
+        return 'broken', None
+    if not isinstance(data, dict) or not isinstance(data.get('skills'), list):
+        return 'broken', None
+    return 'ok', data
+
+
+def _sync_manifest(ident, directory, remove=False, runtime=None, entry=None) -> dict:
+    """按单个 ID 改清单：装/覆盖写入它的条目，卸载删掉它，其余 skill 原样保留。
+
+    只换这一条（含 tierReason/entry/source 这些 load_manifest 会归一化掉的字段），
+    其它条目一个字节都不动。清单不存在或读不出来就跳过：这时没有"过时结论"可
+    失效，重建交给 skill_manifest.ensure_manifest，绝不在这里造半份清单。
+    市场侧字段（meta.marketDir/overrides、stats.zipsInMarketDir）保持上次全量
+    构建的结论——这里只碰一个已安装 ID，不扫市场。
+    """
+    result = {'ok': False, 'path': '', 'action': 'skipped', 'error': None}
+    module = _skill_manifest()
+    if module is None:
+        result['error'] = _error('no-manifest', '取不到 src/skill_manifest.py')
+        return result
+    try:
+        target = Path(module.default_manifest_path(runtime))
+    except Exception as exc:
+        result['error'] = _error('manifest-path', '%s: %s' % (type(exc).__name__, exc))
+        return result
+    result['path'] = str(target)
+    status, data = _manifest_load(target)
+    if status != 'ok':
+        result.update(ok=True, action=status)
+        return result
+    skills = [item for item in data['skills'] if isinstance(item, dict)]
+    kept = [item for item in skills if str(item.get('id') or '') != ident]
+    if remove and len(kept) == len(skills):
+        result.update(ok=True, action='absent')       # 清单里本来就没有它，不必重写
+        return result
+    if not remove:
+        if not entry:  # 空 dict 也算没算出来：别把一条空记录写进清单
+            try:
+                entry = module._skill_entry(ident, directory, 'installed')
+            except Exception as exc:
+                result['error'] = _error('manifest-entry', '%s: %s' % (type(exc).__name__, exc))
+                return result
+        kept.append(entry)
+    kept.sort(key=lambda item: str(item.get('id') or ''))
+    old_stats = data.get('stats') if isinstance(data.get('stats'), dict) else {}
+    meta = dict(data.get('meta') if isinstance(data.get('meta'), dict) else {})
+    meta.setdefault('version', getattr(module, 'MANIFEST_VERSION', 1))
+    meta.setdefault('generator', 'src/skill_manifest.py')
+    meta['writtenAt'] = int(time.time())
+    manifest = dict(data)
+    manifest['meta'] = meta
+    manifest['skills'] = kept
+    manifest['stats'] = module._stats(kept, int(old_stats.get('zipsInMarketDir') or 0))
+    try:
+        module._atomic_write(target, manifest, time.time())
+    except Exception as exc:
+        result['error'] = _error('manifest-write', '%s: %s' % (type(exc).__name__, exc))
+        return result
+    action = 'removed' if remove else ('replaced' if len(kept) == len(skills) else 'added')
+    result.update(ok=True, action=action)
+    return result
+
+
+def _invalidate_registry() -> bool:
+    """让扩展发现缓存丢掉旧结论。
+
+    extension_registry 只有整份 invalidate()（清 _SCAN_CACHE/_STATE_CACHE），没有
+    按 ID 的接口；缓存按状态文件路径整体存一份扫描结果，也没有办法只摘一条。
+    """
+    try:
+        extension_registry.invalidate()
+    except Exception:
+        return False
+    return True
 
 
 def install(zip_path, runtime=None, force=False, enable=True) -> dict:
@@ -667,7 +784,8 @@ def install(zip_path, runtime=None, force=False, enable=True) -> dict:
     """
     result = {'ok': False, 'id': '', 'path': '', 'entry': '', 'files': 0, 'bytes': 0,
               'replaced': False, 'tier': '', 'tools': [], 'enabled': None, 'note': '',
-              'manifest': {}, 'error': None}
+              'manifest': {}, 'manifestSynced': False, 'manifestAction': '',
+              'manifestPath': '', 'registryInvalidated': False, 'error': None}
     try:
         archive = _open_archive(zip_path)
     except MarketError as exc:
@@ -696,12 +814,20 @@ def install(zip_path, runtime=None, force=False, enable=True) -> dict:
         package = (staging / manifest_rel).parent if '/' in manifest_rel else staging
         replaced = _swap_into_place(package, dest, ident)
         detail = _classify_detail(dest)
-        tier, tools = _installed_placement(dest, ident, detail, runtime)
+        skill_entry = _entry_for(ident, dest)
+        tier, tools = _installed_placement(dest, ident, detail, runtime, skill_entry)
         state = _enable_decision(ident, tier, detail.get('blockers'),
                                  _registry_data_dir(runtime), enable)
         result.update(ok=True, files=files, bytes=total, replaced=replaced,
                       tier=tier, tools=tools, enabled=state['enabled'],
                       note=state['note'])
+        # 清单与扩展发现缓存里还留着这个 id 的旧结论，按 id 就地换掉；失败不影响安装结果。
+        sync = _sync_manifest(ident, dest, runtime=runtime, entry=skill_entry)
+        result.update(manifestSynced=bool(sync['ok']), manifestAction=sync['action'],
+                      manifestPath=sync['path'])
+        if sync['error']:
+            result['manifestError'] = sync['error']
+        result['registryInvalidated'] = _invalidate_registry()
         return result
     except MarketError as exc:
         result['error'] = _error(exc.code, str(exc))
@@ -723,7 +849,9 @@ def install(zip_path, runtime=None, force=False, enable=True) -> dict:
 def uninstall(skill_id, runtime=None) -> dict:
     """只删 <data>/skill_extensions/<id> 这一层；id 不合法或不在根内一律不删。"""
     ident = str(skill_id or '').strip()
-    result = {'ok': False, 'id': ident, 'path': '', 'removed': False, 'error': None}
+    result = {'ok': False, 'id': ident, 'path': '', 'removed': False,
+              'manifestSynced': False, 'manifestAction': '', 'manifestPath': '',
+              'registryInvalidated': False, 'error': None}
     if not ID_PATTERN.match(ident):
         result['error'] = _error('bad-id', 'skill id 不合法：%r（要求 %s）' % (ident, ID_HINT))
         return result
@@ -744,6 +872,13 @@ def uninstall(skill_id, runtime=None) -> dict:
         result['error'] = _error('remove-failed', '删不掉 %s：%s' % (dest, exc))
         return result
     result.update(ok=True, removed=True)
+    # 包已经不在了，清单里的条目与扩展发现缓存里的记录都必须跟着消失。
+    sync = _sync_manifest(ident, dest, remove=True, runtime=runtime)
+    result.update(manifestSynced=bool(sync['ok']), manifestAction=sync['action'],
+                  manifestPath=sync['path'])
+    if sync['error']:
+        result['manifestError'] = sync['error']
+    result['registryInvalidated'] = _invalidate_registry()
     return result
 
 

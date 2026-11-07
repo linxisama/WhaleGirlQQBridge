@@ -995,18 +995,62 @@ def _fill_mcp_server(result: dict, found: dict, reader, data_dir=None) -> None:
             "command=%s 是裸可执行名，运行时会从 PATH 解析：确认部署机器上已经装好它" % command))
 
 
+def _static_load(tier: str, error: str, code: str, warnings=None) -> dict:
+    """静态分层结论：只说「按 tier 能不能注册」，不是加载探针的结果。
+
+    ok 与运行时放行闸（skill_tools._skill_plan）同一口径，都引用 DEFAULT_TIERS，
+    所以预检 / 安装 / 候选列表三方结论不会各自漂移。
+    """
+    ok = tier in skill_tools.DEFAULT_TIERS
+    if ok:
+        stage = "static-registerable"
+    elif tier in skill_tools.BLOCKED_TIERS:
+        stage = "static-blocked"
+    else:
+        stage = "static-unsupported"
+    return {"ok": ok,
+            "error": "" if ok else (error or tier or "层级未知"),
+            "code": code,
+            "stage": stage,
+            "checked": "static-classify",
+            "warnings": [str(one) for one in (warnings or []) if str(one)]}
+
+
+def _tier_reason(tier: str) -> str:
+    """tier 自身为什么不放行：T4/T6 有结构性原因，其余按默认放行集说清范围。"""
+    reason = str(skill_tools.BLOCKED_TIERS.get(tier) or "")
+    if reason:
+        return reason
+    return "层级 %s 默认不放行（只放 %s）" % (tier or "未知", "/".join(skill_tools.DEFAULT_TIERS))
+
+
+def _static_gaps(usage, permissions=()) -> List[str]:
+    """静态可注册 ≠ 业务可用：宿主给不了的 ctx 成员写进 warnings。"""
+    try:
+        missing = skill_tools.blocked_capabilities(usage or (), permissions or ())
+    except Exception:
+        return []
+    if not missing:
+        return []
+    return ["宿主未提供 %s：静态可注册只说明注册期放行，用到它们的分支运行期拿不到"
+            % ", ".join(sorted(missing)[:8])]
+
+
 def _fill_skill(result: dict, reader, skills_runtime, tools_map: Dict[str, dict]) -> None:
     """技能走既有分层判断（src/skill_manifest.classify），tier/reason 进 load 与 notices。"""
     tier, reason, tools = "T6-disabled", "unclassified", []
+    usage, permissions = [], []
     try:
         info = skill_manifest.classify(reader, tools=tools_map)
         tier = str(info.get("tier") or tier)
         reason = str(info.get("tierReason") or reason)
         tools = [str(entry.get("name") or "") for entry in (info.get("tools") or []) if entry.get("name")]
+        usage = list(info.get("usage") or [])
+        permissions = list(info.get("permissions") or [])
     except Exception as exc:
         reason = "classify-failed: %s: %s" % (type(exc).__name__, exc)
     result["tools"] = tools
-    result["load"] = {"ok": tier == "T1-ready", "error": "" if tier == "T1-ready" else reason, "code": tier}
+    result["load"] = _static_load(tier, reason, tier, _static_gaps(usage, permissions))
     result["notices"].append(_notice("skill-tier", "分层判定 %s：%s" % (tier, reason)))
     if skills_runtime is not None and result["id"]:
         result["target_dir"] = str(Path(skills_runtime) / "skills" / result["id"])
@@ -1585,10 +1629,13 @@ def _install_skill(result: dict, path, options: dict) -> None:
     result["bytes"] = int(outcome.get("bytes") or result["bytes"] or 0)
     tier = str(outcome.get("tier") or "")
     note = str(outcome.get("note") or "")
-    result["load"] = {"ok": tier == "T1-ready",
-                      "error": "" if tier == "T1-ready" else (note or tier or "层级未知"),
-                      "code": tier or "unknown-tier"}
     enabled = outcome.get("enabled")
+    # 静态可注册却仍没启用（默认停用 / 按选择停用 / 有阻塞原因）：结论写进 warnings，
+    # 不拿它冒充失败——包确实落盘了，只是没登记为启用。
+    gaps = [note] if note and enabled is False and tier in skill_tools.DEFAULT_TIERS else []
+    # error 说「为什么不放行」；市场侧那句启用说明（默认停用 / 已启用）不是分层原因，
+    # 它只在停用时进 warnings，并照旧由 installed-disabled 的 notice 交代。
+    result["load"] = _static_load(tier, _tier_reason(tier), tier or "unknown-tier", gaps)
     result["installed_but_disabled"] = enabled is False
     if enabled is False:
         result["notices"].append(_notice(

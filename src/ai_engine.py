@@ -217,6 +217,13 @@ class AIEngine:
         except (TypeError, ValueError):
             self.history_max_messages = 24
         self.adaptive_max_tokens = bool(adaptive_max_tokens)
+        # 能力桥的 llm.endpoint-pick / llm.endpoint-feedback 落点（由 qq_app 在启动时
+        # 挂上来）。两个都是 None 时行为与本改动之前一个字节都不差；引擎自己不 import
+        # 任何插件模块，避免"引擎依赖插件"的反向耦合。
+        #   endpoint_picker(model) -> {'baseUrl','apiKey','model','id'} 或 {}
+        #   endpoint_reporter(payload) -> 任意（忽略返回值）
+        self.endpoint_picker = None
+        self.endpoint_reporter = None
         self.trimmed_tokens = 0          # 累计被裁掉的估算 token 数（给控制台看）
         self.usage = TokenUsage()
         self._clients: dict[int, httpx.AsyncClient] = {}
@@ -956,19 +963,59 @@ class AIEngine:
                     if transformed.get("omitTemperature"):
                         payload.pop("temperature", None)
 
+        # 能力桥的 llm.endpoint-pick（宿主 llm.js:279 的落点）：每次真实请求都重新挑，
+        # 所以多轮对话里能自然轮转。挑中的端点只作用于**本次调用**：self.api_url 是
+        # 实例属性，重试循环与并发请求都在用，直接改会让别的会话跟着漂。
+        request_url, request_key = self.api_url, self.api_key
+        pool_id = ''
+        picker = getattr(self, 'endpoint_picker', None)
+        if callable(picker):
+            try:
+                picked = await picker(str(payload.get("model") or self.model or ""))
+            except Exception as exc:
+                logger.warning(f"llm.endpoint-pick 失败（已忽略）：{type(exc).__name__}: {exc}")
+                picked = None
+            if isinstance(picked, dict) and picked.get("baseUrl"):
+                request_url = self._normalize_api_url(str(picked["baseUrl"]), self.api_style)
+                request_key = str(picked.get("apiKey") or self.api_key)
+                pool_id = str(picked.get("id") or "")
+                if picked.get("model"):
+                    payload["model"] = str(picked["model"]).strip()
+
+        def _report_pool(ok, status=0, error='', latency_ms=None):
+            """回报账号池一次调用结果（llm.js:499 reportPoolFeedback 的落点）。
+
+            只在本次真的换了端点时才报：没换端点却去起一个 node 进程，
+            等于给每条消息白加一次冷启动。
+            """
+            reporter = getattr(self, 'endpoint_reporter', None)
+            if not callable(reporter) or not (pool_id or request_url != self.api_url):
+                return
+            payload_report = {"accountId": pool_id, "ok": bool(ok)}
+            if ok:
+                payload_report["latencyMs"] = int(latency_ms or 0)
+            else:
+                payload_report["status"] = int(status or 0)
+                payload_report["error"] = str(error or '')[:300]
+            try:
+                reporter(payload_report)
+            except Exception as exc:
+                logger.warning(f"llm.endpoint-feedback 失败（已忽略）：{type(exc).__name__}: {exc}")
+
         # 重试循环
         last_error = None
         empty_retried = False       # 空回复只加大额度重试一次
         saw_reasoning = False       # 本轮里是否见过思考内容（用于给出准确的中文原因）
         for attempt in range(self.max_retries):
+            started_at = time.monotonic()
             try:
                 client = await self._get_client()
-                logger.debug(f"AI 请求: url={self.api_url}, model={payload['model']}, attempt={attempt + 1}")
-                response = await client.post(self.api_url, json=payload,
+                logger.debug(f"AI 请求: url={request_url}, model={payload['model']}, attempt={attempt + 1}")
+                response = await client.post(request_url, json=payload,
                                             timeout=httpx.Timeout(request_timeout),
                                             # 每次请求都带鉴权头：改完密钥立刻生效，
                                             # 不再依赖"客户端创建时"的那一份
-                                            headers=self._auth_headers(self.api_style, self.api_key))
+                                            headers=self._auth_headers(self.api_style, request_key))
                 response.raise_for_status()
 
                 data = response.json()
@@ -1025,10 +1072,13 @@ class AIEngine:
                 self.last_error = ("" if (content or has_tool) else
                                    empty_reply_reason(finish_reason, reasoning, payload, saw_reasoning))
                 logger.debug(f"AI 回复成功 (attempt {attempt + 1})")
+                _report_pool(True, latency_ms=(time.monotonic() - started_at) * 1000)
                 return _out(content, message, blocks, finish_reason)
 
             except httpx.TimeoutException:
                 last_error = f"请求超时 ({request_timeout:g}s)"
+                _report_pool(False, status=0, error=last_error,
+                             latency_ms=(time.monotonic() - started_at) * 1000)
                 logger.warning(f"AI 请求超时 (attempt {attempt + 1}/{self.max_retries})")
                 # 超时要不要再试一次：中转站的慢是**单次抖动**，第二次往往 1 秒就回来了
                 # （用户实测：15 秒超时后直接放弃 → QQ 里只看到"没能生成回复"）。
@@ -1053,6 +1103,8 @@ class AIEngine:
                 status = e.response.status_code
                 detail = self._mask_secret(self._body_detail(e.response), self.api_key)
                 last_error = self._http_message(status, detail)
+                _report_pool(False, status=status, error=last_error,
+                             latency_ms=(time.monotonic() - started_at) * 1000)
                 if (payload.get("tools") and status in (400, 422)
                         and "tool" in str(detail).lower()):
                     # 这个后端/中转站不认 tools：立刻返回空文本，别把重试循环耗在
@@ -1073,8 +1125,12 @@ class AIEngine:
                     return _out("")
             except httpx.ConnectError:
                 last_error = '网络连接失败（ConnectError），请检查真实API地址、网络和代理。'
+                _report_pool(False, status=0, error=last_error,
+                             latency_ms=(time.monotonic() - started_at) * 1000)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                _report_pool(False, status=0, error=last_error,
+                             latency_ms=(time.monotonic() - started_at) * 1000)
                 logger.warning(f"AI 请求异常: {last_error} (attempt {attempt + 1}/{self.max_retries})")
 
             # 指数退避（超时重试时跳过：刚等过一整个超时，再等 1 秒只是白拖）
@@ -1085,6 +1141,8 @@ class AIEngine:
                 continue
 
         self.last_error = last_error or "请求失败"
+        _report_pool(False, status=0, error=self.last_error,
+                     latency_ms=(time.monotonic() - started_at) * 1000)
         logger.error(f"AI 请求最终失败: {last_error}")
         return ""
 

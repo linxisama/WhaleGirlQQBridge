@@ -63,7 +63,7 @@ def _readable_segments(reply: str) -> tuple[str, ...]:
     """清理“不适合朗读”的内容（1.6.3）：代码块/长链接按可见规则摘要或保留文字。
 
     初版保守：按行保留可读中文/英文短句，跳过围栏代码块与超长 URL。
-    TODO(T08): 按配置的字数上限切段，切分时**明确说明**而非静默截断。
+    字数上限不在这里处理：那是 fit_segments 的事，本函数只挑「哪些行能读」。
     """
     out: list[str] = []
     in_code = False
@@ -76,3 +76,42 @@ def _readable_segments(reply: str) -> tuple[str, ...]:
             continue
         out.append(s)
     return tuple(out)
+
+_SENTENCE_ENDS = '。！？!?；;…~'
+
+
+def fit_segments(segments, limit: int) -> tuple[str, bool]:
+    """把可朗读的段拼成一句话并压到 limit 字以内，返回 (文本, 是否被截断)。
+
+    T08 要求「截断必须说明，不能静默改变意思」，所以这里只按整段/整句取舍：
+    宁可少读一句，也不在句子中间切 —— 半句被念出来，听感上就是换了意思。
+    只有当前段自己就放不下、且剩余空间里还有句末符时才切到句末；切不出整句就整段不要。
+    """
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = 0
+    pieces = [str(raw or '').strip().strip('，。 ') for raw in (segments or ())]
+    pieces = [piece for piece in pieces if piece]
+    if limit <= 0:
+        return '', bool(pieces)
+    picked: list[str] = []
+    used = 0
+    truncated = False
+    for piece in pieces:
+        cost = len(piece) + (1 if picked else 0)
+        if used + cost <= limit:
+            picked.append(piece)
+            used += cost
+            continue
+        # 这一句放不下：只在它内部找句末符切一刀，切不出整句就整句放弃。
+        room = max(0, limit - used - (1 if picked else 0))
+        cut = 0
+        for index, char in enumerate(piece[:room]):
+            if char in _SENTENCE_ENDS:
+                cut = index + 1
+        if cut:
+            picked.append(piece[:cut])
+        truncated = True
+        break
+    return '，'.join(picked), truncated

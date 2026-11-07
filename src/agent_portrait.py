@@ -5,7 +5,8 @@
 - 本模块只做「读素材 → 组装提示 → 落盘 → 维护记忆」，**不联网、不碰 AIEngine**；
   模型函数由调用方注入（refresh(generate=...)），测试可以完全离线；
 - 旧版不覆盖式丢弃：写新正文前先把旧正文快照到 <data_dir>/我是谁-history/；
-- 正文同时维护成一条 layer='soul'、tags=['portrait'] 的记忆，渠道/人设留空 = 全局 soul；
+- 正文同时维护成一条 layer='soul'、tags=['portrait'] 的记忆：默认人设（persona=''）留空 = 全局 soul，
+  其它人设带自己的 persona，读写都按人设过滤；
 - 写入一律 UTF-8 无 BOM、LF，同目录 .tmp 前缀 + os.replace 原子替换。
 
 开关 ai.portrait_enabled 默认关闭：关着时 refresh 直接返回 disabled，连提示都不组装。
@@ -31,6 +32,10 @@ PORTRAIT_SOURCE = 'portrait'
 # 所以"这条是不是自画像"只认 tags 里的 PORTRAIT_TAG，source 命中只作为兼容分支。
 PORTRAIT_FILE = '我是谁.md'
 HISTORY_DIR = '我是谁-history'
+PERSONA_DIR = 'personas'
+PERSONA_MAX = 64
+# 跟 agent_dream.DIARY_NAME 同一个文件名；两模块互相 import 会绕成环，所以各写各的。
+DIARY_FILE = '日记.md'
 
 INSTRUCTION = (
     '请用第一人称重写一份「我是谁」：200–400 字，中文散文，不分小标题、不用列表；\n'
@@ -87,22 +92,66 @@ def settings(config) -> dict:
     return {'enabled': _flag(_cfg_get(config, 'ai.portrait_enabled', DEFAULTS['enabled']))}
 
 
+# ---------- 人设 ----------
+
+_CONTROL = re.compile(r'[\x00-\x1f\x7f]')
+_NAME_BAD = re.compile(r'[<>:"|?*\\/]')
+_RESERVED = frozenset({'CON', 'PRN', 'AUX', 'NUL'} |
+                      {'COM%d' % index for index in range(1, 10)} |
+                      {'LPT%d' % index for index in range(1, 10)})
+
+
+def persona_slug(persona) -> str:
+    """人设名 → 安全的目录名：去控制字符、路径分隔符与 Windows 非法字符，最长 PERSONA_MAX。
+
+    默认人设（'' 或清洗后什么都不剩）返回 ''，由 persona_dir 决定落回 data_dir 本身。
+    清洗只会把字符换成 '-'，不保留任何分隔符，所以拼出来的目录永远在 data_dir 之内。
+    """
+    text = _CONTROL.sub('', str(persona or '')).strip()
+    text = _NAME_BAD.sub('-', text).strip('. ')
+    text = text[:PERSONA_MAX].strip('. ')
+    if text.upper() in _RESERVED:
+        text = '_' + text
+    return text
+
+
+def persona_dir(data_dir, persona='') -> Path:
+    """人设数据目录：默认人设就是 data_dir 本身（旧路径逐字节不变），其余进 personas/<slug>/。"""
+    slug = persona_slug(persona)
+    root = Path(data_dir)
+    if not slug:
+        return root
+    return root / PERSONA_DIR / slug
+
+
+def persona_search(memory, persona, query='', **kwargs):
+    """按人设取记忆：默认人设保持改动前的全局口径，非默认人设硬过滤到自己那份。
+
+    strict_scope 只在 persona 非空时才在 SQL 里加 persona 条件，所以默认人设仍然读得到
+    历史数据（那些行 persona 本来就是 ''）。
+    """
+    slug = persona_slug(persona)
+    if slug:
+        return memory.search(query=query, persona=slug, strict_scope=True, **kwargs)
+    return memory.search(query=query, **kwargs)
+
+
 # ---------- 路径 ----------
 
-def portrait_path(data_dir) -> Path:
-    return Path(data_dir) / PORTRAIT_FILE
+def portrait_path(data_dir, persona='') -> Path:
+    return persona_dir(data_dir, persona) / PORTRAIT_FILE
 
 
-def history_dir(data_dir) -> Path:
-    return Path(data_dir) / HISTORY_DIR
+def history_dir(data_dir, persona='') -> Path:
+    return persona_dir(data_dir, persona) / HISTORY_DIR
 
 
 # ---------- 读 ----------
 
-def read_portrait(data_dir) -> str:
+def read_portrait(data_dir, persona='') -> str:
     """读当前自画像正文；不存在或读失败返回空串（BOM 与首尾空白一并去掉）。"""
     try:
-        text = portrait_path(data_dir).read_text(encoding='utf-8', errors='ignore')
+        text = portrait_path(data_dir, persona).read_text(encoding='utf-8', errors='ignore')
     except OSError:
         return ''
     return text.lstrip('\ufeff').strip()
@@ -158,10 +207,10 @@ def _stamp(now):
     return moment.strftime('%Y%m%d-%H%M%S')
 
 
-def _snapshot(data_dir, old, now):
+def _snapshot(data_dir, old, now, persona=''):
     """旧正文进 我是谁-history/<YYYYmmdd-HHMMSS>.md；同一秒重复时追加 -2、-3…"""
     stamp = _stamp(now)
-    folder = history_dir(data_dir)
+    folder = history_dir(data_dir, persona)
     name, index = stamp, 1
     while True:
         target = folder / f'{name}.md'
@@ -181,24 +230,24 @@ def _is_portrait(item):
     return PORTRAIT_TAG in (item.get('tags') or [])
 
 
-def _upsert_memory(memory, body, source):
-    """自画像在记忆里只留一条：找到就 update，找不到才 remember。"""
+def _upsert_memory(memory, body, source, persona=''):
+    """自画像在记忆里只留一条：找到就 update，找不到才 remember；按人设各留一条。"""
     evidence = f'自画像重写（{source}）'[:1000]
-    for item in memory.search('', layer='soul', limit=50):
+    for item in persona_search(memory, persona, '', layer='soul', limit=50):
         if _is_portrait(item):
             updated = memory.update(item['id'], content=body, importance=95, evidence=evidence)
             return str((updated or item)['id']), False
     created = memory.remember(body, source=PORTRAIT_SOURCE, layer='soul', importance=95,
-                              confidence=95, channel='', persona='',
+                              confidence=95, channel='', persona=persona_slug(persona),
                               tags=[PORTRAIT_TAG], evidence=evidence)
     return str(created['id']), not created.get('merged', False)
 
 
 # ---------- 提示 ----------
 
-def _soul_digest(memory):
+def _soul_digest(memory, persona=''):
     lines = []
-    for item in memory.search('', layer='soul', limit=SOUL_LIMIT):
+    for item in persona_search(memory, persona, '', layer='soul', limit=SOUL_LIMIT):
         if _is_portrait(item):
             continue
         text = str(item.get('content') or '').strip()
@@ -207,7 +256,22 @@ def _soul_digest(memory):
     return '\n'.join(lines)
 
 
-def _diary_digest(memory):
+def _diary_digest(memory, data_dir=None, persona=''):
+    """日记尾部：默认人设沿用 memory.diary_tail（旧口径），非默认人设只读自己目录里的日记。
+
+    diary_entries 表没有 persona 列（day 还是 UNIQUE），全局日记尾巴无法按人设过滤，
+    所以非默认人设宁可这一段空着，也不把别人的日记塞进自己的自画像提示词。
+    """
+    slug = persona_slug(persona)
+    if slug:
+        if data_dir is None:
+            return ''
+        try:
+            raw = (persona_dir(data_dir, persona) / DIARY_FILE).read_text(
+                encoding='utf-8', errors='ignore')
+        except OSError:
+            return ''
+        return str(raw or '').strip()[-DIARY_CAP:]
     reader = getattr(memory, 'diary_tail', None)
     if not callable(reader):
         return ''
@@ -217,20 +281,20 @@ def _diary_digest(memory):
         return ''
 
 
-def build_prompt(memory, data_dir, *, max_chars=3000, now=None) -> str:
+def build_prompt(memory, data_dir, *, max_chars=3000, now=None, persona='') -> str:
     """拼素材（旧版自述 / soul 记忆 / 日记尾部）+ 固定指令；超长只裁素材，不裁指令。"""
     try:
         max_chars = max(400, min(20000, int(max_chars or 3000)))
     except (TypeError, ValueError):
         max_chars = 3000
     sections = []
-    previous = read_portrait(data_dir)
+    previous = read_portrait(data_dir, persona)
     if previous:
         sections.append(('【上一版自述，可以沿用】', previous[:PREV_CAP]))
-    soul = _soul_digest(memory)
+    soul = _soul_digest(memory, persona)
     if soul:
         sections.append(('【记忆里最要紧的几条】', soul[:SOUL_CAP]))
-    diary = _diary_digest(memory)
+    diary = _diary_digest(memory, data_dir, persona)
     if diary:
         sections.append(('【最近的日记（时间线）】', diary[:DIARY_CAP]))
     budget = max_chars - len(INSTRUCTION) - 2
@@ -253,24 +317,24 @@ def build_prompt(memory, data_dir, *, max_chars=3000, now=None) -> str:
 
 # ---------- 写 ----------
 
-def write_portrait(memory, data_dir, text, *, source='dream', now=None) -> dict:
-    """旧版快照 → 原子写正文 → 维护唯一的 soul 记忆。"""
+def write_portrait(memory, data_dir, text, *, source='dream', now=None, persona='') -> dict:
+    """旧版快照 → 原子写正文 → 维护唯一的 soul 记忆（每个 persona 各一条）。"""
     body = _tidy(str(text or '').replace('\r\n', '\n').replace('\r', '\n'))
     truncated = len(body) > MAX_BODY
     if truncated:
         body = body[:MAX_BODY].rstrip()
-    old = read_portrait(data_dir)
-    snapshot = _snapshot(data_dir, old, now) if old else ''
-    path = portrait_path(data_dir)
+    old = read_portrait(data_dir, persona)
+    snapshot = _snapshot(data_dir, old, now, persona) if old else ''
+    path = portrait_path(data_dir, persona)
     _write_text(path, body)
-    memory_id, created = _upsert_memory(memory, body, source)
+    memory_id, created = _upsert_memory(memory, body, source, persona)
     return {'ok': True, 'path': str(path), 'chars': len(body), 'truncated': truncated,
             'snapshot': snapshot, 'memory_id': memory_id, 'created': created}
 
 
 # ---------- 刷新 ----------
 
-def refresh(memory, data_dir, *, generate, config=None, now=None) -> dict:
+def refresh(memory, data_dir, *, generate, config=None, now=None, persona='') -> dict:
     """关着就不动；开着就：组装提示 → generate(prompt) → 清洗 → 落盘并维护记忆。
 
     只支持同步 generate：返回 awaitable 时不做事件循环，直接报
@@ -278,7 +342,7 @@ def refresh(memory, data_dir, *, generate, config=None, now=None) -> dict:
     """
     if not settings(config).get('enabled'):
         return {'ok': False, 'reason': 'disabled'}
-    prompt = build_prompt(memory, data_dir, now=now)
+    prompt = build_prompt(memory, data_dir, now=now, persona=persona)
     try:
         raw = generate(prompt)
     except Exception as error:
@@ -291,5 +355,5 @@ def refresh(memory, data_dir, *, generate, config=None, now=None) -> dict:
     body = clean_text(raw)
     if len(body) < MIN_BODY:
         return {'ok': False, 'reason': 'too_short'}
-    result = write_portrait(memory, data_dir, body, now=now)
+    result = write_portrait(memory, data_dir, body, now=now, persona=persona)
     return {**result, 'ok': True}

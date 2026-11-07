@@ -1,6 +1,6 @@
 """Local backend identity shared by the desktop UI and QQ service."""
 from pathlib import Path
-APP_VERSION = '5.2.110'
+APP_VERSION = '5.2.112'
 APP_ID='WhaleGirlQQ'
 
 def backend_identity_error(identity,root):

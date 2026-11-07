@@ -26,7 +26,7 @@ DSH_TOOLS=('whale_bot_mcp.py','whale_memory_mcp.py','whale_tools_mcp.py','verify
 # 与载荷配套的说明文档：讲清能力边界与怎么排障，用户排障时手边得有。
 DSH_DOCS=('扩展能力桥-使用与排障.md','扩展能力桥-能力边界.md','技能市场-使用与排障.md','扩展与技能市场-总览.md',
           '交付说明-本轮.md','交付说明-Agent平台.md','插件接入契约-mod.md',
-          '插件规格-v1.md','新方向-Agent平台-框架.md','新方向-任务书-Agent平台.md')
+          '插件规格-v1.md','插件交接说明.md','新方向-Agent平台-框架.md','新方向-任务书-Agent平台.md')
 
 def collect_paths(root=ROOT):
     """按白名单收集要打包的文件（绝对路径）；缺失的可选项跳过，不报错。"""

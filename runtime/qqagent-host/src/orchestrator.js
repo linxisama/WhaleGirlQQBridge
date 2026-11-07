@@ -725,7 +725,7 @@ export class Orchestrator {
       sent: session.sent || [],
       api: this.#judgeApi(),
       cap: (name) => this.#capFirst(name, skillContext),
-      log: (message) => skillManager.recordError('reply-safety', message)
+      log: (message) => skillManager.recordError('reply-safety-plus', message)
     });
   }
 
@@ -759,8 +759,21 @@ export class Orchestrator {
       && modelImageVerdict(cfg.api.provider, cfg.api.model) !== 'no-vision';
     const searchEnabled = cfg.webSearch?.enabled !== false;
     const toolsCfg = cfg.tools || {};
+    // ── 本地聊天按"私聊主人"对外呈现（主人 2026-10-22 要求）──
+    // local:console 只存在于本机控制台，能操作的只有主人本人。如果原样把 kind='local'
+    // 传给技能/插件，那些"只放行主人私聊"的判断（autopilot 的 gate、主人识别…）就会拒绝，
+    // 表现为"在聊天页让她干活，她回：这个只有主人私聊能用"。
+    // 所以这里把 kind 映射成 private、chatId 映射成主人 QQ，chatKey 保持 local:console
+    // （发送仍由 sender 看见 local: 前缀走本地回写，不会真的发到 QQ）。
+    const isLocalChat = String(chatKey).startsWith('local:');
+    const ownerQQForCtx = String(
+      getConfig().skills?.autopilot?.ownerQQ || (getConfig().allow?.private || [])[0] || ''
+    ).trim();
+    const ctxKind = isLocalChat ? 'private' : kind;
+    const ctxChatId = isLocalChat ? (ownerQQForCtx || chatId) : chatId;
     const skillContext = {
-      chatKey, kind, chatId, chatName,
+      chatKey, kind: ctxKind, chatId: ctxChatId, chatName,
+      local: isLocalChat,
       model: cfg.api.model,
       provider: cfg.api.provider,
       visionEnabled,
@@ -820,8 +833,40 @@ export class Orchestrator {
         ? [{ id: 'owner-rules-run', title: '', priority: 72, content: ownerRules }]
         : []
     });
+    // ── 本地聊天：只读借用某个存档的记忆与历史 ────────────────────────
+    // 规则（主人 2026-10-21 定的）：
+    //   · 默认读「主人私聊」那个存档；也能指定任意存档，或干脆一个都不读；
+    //   · **只读**：读的是别人的历史与记忆，写永远写在自己（local:console）身上；
+    //   · 轮数可设（readRounds），换算成消息条数≈2×轮；
+    //   · 聊天自己的记忆文件与其它存档完全隔离，不共享、不回灌。
+    let localRead = null;
+    if (String(chatKey).startsWith('local:')) {
+      const lc = getConfig().localChat || {};
+      const rounds = Math.max(1, Math.min(200, Number(lc.readRounds) || 20));
+      // 默认 'none'：聊天只用自己的记忆（主人 2026-10-22 定）。
+      // '' 是显式选择"自动挑主人私聊"，undefined 才是没配过 → none。
+      const want = lc.readArchive === undefined ? 'none' : String(lc.readArchive).trim();
+      if (want !== 'none') {
+        let key = want;
+        if (!key) {
+          // 默认：主人私聊（配置里的白名单私聊 / autopilot 的主人 QQ）；都没有就取最近有消息的私聊
+          const c0 = getConfig();
+          const firstPrivate = (c0.allow?.private || []).map(String)[0] || '';
+          const ownerQQ = String(c0.skills?.autopilot?.ownerQQ || '').trim() || firstPrivate;
+          if (ownerQQ) key = `private:${ownerQQ}`;
+          if (!key || !this.store.listChats().includes(key)) {
+            const priv = this.store.listChats().filter((k) => k.startsWith('private:'));
+            key = priv.sort((a, b) => (this.store.getChatMeta(b).lastTs || 0) - (this.store.getChatMeta(a).lastTs || 0))[0] || '';
+          }
+        }
+        if (key && key !== chatKey) localRead = { key, limit: rounds * 2 };
+      }
+    }
+
     const userPrompt = buildUserPrompt({
       chatKey, kind, chatId, chatName,
+      // 只读来源：有值就借它的历史与记忆（写仍然落在 chatKey 上）
+      contextFrom: localRead?.key || null,
       triggerEntries,
       store: this.store,
       memory: this.memory,
@@ -830,7 +875,8 @@ export class Orchestrator {
       runSeq: seq,
       moreUnreadDuringRun: this.store.unreadCount(chatKey) > 0,
       proactive,
-      contextLimit,
+      // 本地聊天按「轮数」限制读多少历史（读别人的存档时用），其它会话照旧
+      contextLimit: localRead ? localRead.limit : contextLimit,
       tierInfo,
       skillContext,
       // 活跃模式：注入当前话题锚点（buildUserPrompt 据此渲染【活跃模式】段）
@@ -905,7 +951,7 @@ export class Orchestrator {
     const openAiTools = toOpenAiTools(toolDefs);
 
     const ctx = {
-      chatKey, kind, chatId,
+      chatKey, kind: ctxKind, chatId: ctxChatId, local: isLocalChat,
       selfId: this.onebot.selfId,
       selfNickname,
       botName: cfg.persona.botName,
@@ -1052,7 +1098,7 @@ export class Orchestrator {
                 && JSON.stringify(x.args ?? {}) === JSON.stringify(c.args ?? {}));
               if (!same) inlineCalls.push(c);
             }
-          } catch (error) { skillManager.recordError('reply-safety', error); }
+          } catch (error) { skillManager.recordError('reply-safety-plus', error); }
         }
         // 正文顺势记成候选草稿：后面 grounded-select 只允许"从草稿里挑原句"，
         // 没有这一步，筛选会把所有候选都判成"无出处"而全部丢掉。
@@ -1246,7 +1292,7 @@ export class Orchestrator {
               finish = true;
               session.finishReason = session.finishReason || '本地收尾策略判定：本批已交付完毕';
             }
-          } catch (error) { skillManager.recordError('reply-safety', error); }
+          } catch (error) { skillManager.recordError('reply-safety-plus', error); }
         }
       }
       messages.push(...toolResults.map(({ role, tool_call_id, name, content }) => ({ role, tool_call_id, content, name })));

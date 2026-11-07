@@ -10,6 +10,20 @@ from . import PluginBase, PluginMeta, FieldSchema
 _TZ_CST = timezone(timedelta(hours=8))
 
 
+def _persona_for(runtime, group_id):
+    """按群绑定取人设；拿不到就回落全局人设。
+
+    主动开话题也是一条会发进那个群的消息，用全局人设等于把别处的口吻带进来。
+    异常一律吞掉：选人设失败不该让整轮主动消息停摆。
+    """
+    try:
+        from ..persona_bindings import resolve_persona
+        persona = resolve_persona(runtime, {"kind": "group", "target": str(group_id), "text": ""})
+        return persona.full_prompt()
+    except Exception:
+        return runtime.style.full_prompt() if hasattr(runtime, "style") else ""
+
+
 class ProactiveChat(PluginBase):
     META = PluginMeta(
         id="proactive_chat",
@@ -170,7 +184,7 @@ class ProactiveChat(PluginBase):
                 jitter = random.randint(0, self.get("jitterSec", 45))
                 await asyncio.sleep(jitter)
                 if self._last_group_message_time(runtime,group_id)!=last_msg_t:continue
-                topic = await self._get_topic(runtime)
+                topic = await self._get_topic(runtime, group_id)
                 if topic:
                     if self._last_group_message_time(runtime,group_id)!=last_msg_t:continue
                     key=f'proactive:{group_id}:{last_msg_t}:{gs["last_sent"]}'
@@ -186,7 +200,12 @@ class ProactiveChat(PluginBase):
         gs['last_sent']=time.time();gs['today_count']+=1
         self.save_state('schedule.json',self._gstate)
 
-    async def _get_topic(self, runtime) -> str:
+    async def _get_topic(self, runtime, group_id="") -> str:
+        """生成开场白。
+
+        group_id 是用来选人设的：这个群可能绑了专属人设，直接取全局人设
+        会把别人群里的口吻串进来（真机反馈的人设串味之一）。
+        """
         fallbacks = [t.strip() for t in self.get("topics", "").split(";") if t.strip()]
         if not self.get("useModel", True):
             return random.choice(fallbacks) if fallbacks else ""
@@ -198,7 +217,7 @@ class ProactiveChat(PluginBase):
                     {"role": "system",  "content": prompt},
                     {"role": "user",    "content": "随机生成一句开场白"},
                 ],
-                system_prompt=runtime.style.full_prompt(),max_tokens=self.get("maxTokens", 120),
+                system_prompt=_persona_for(runtime, group_id),max_tokens=self.get("maxTokens", 120),
             )
             text = (result or "").strip()
             # 记一次用量：dailyTokenBudget 以前是空设置，现在真的算

@@ -19,6 +19,12 @@ MUTED = '#6F665D'
 ACCENT = '#4A6B74'
 ACCENT_HOVER = '#3A565E'
 SOFT = '#E3EBEC'
+# 以下四项此前是 _apply_style 里的颜色字面量，集中成常量：改主题只动这一处。
+SIDEBAR_BG = 'rgba(250,247,242,235)'
+FIELD_BG = CARD
+FEEDBACK_BG = '#F4EFE8'
+NAV_HOVER = '#F0EBE4'
+DIRTY = '#996B34'
 
 # Simple original vector marks; no Mio character art or external icon package.
 MARKS = {
@@ -238,7 +244,8 @@ class MioShell(QWidget):
     def _sync_settings_state(self):
         dirty = self.settings.dirty_sections()
         self.dirty_label.setText('有未保存修改' if dirty else '无未保存修改')
-        self.dirty_label.setStyleSheet('color:#996B34;font-size:11px;' if dirty else f'color:{MUTED};font-size:11px;')
+        self.dirty_label.setStyleSheet(f'color:{DIRTY};font-size:11px;' if dirty
+                                       else f'color:{MUTED};font-size:11px;')
         for key, button in self.buttons.items():
             title = self.ROUTES[key][1]
             button.setText('' if self._compact else title + (' *' if key in dirty else ''))
@@ -290,17 +297,17 @@ class MioShell(QWidget):
 
     def _apply_style(self):
         self.setStyleSheet(f'''
-            QFrame#mioSidebar {{ background:rgba(250,247,242,235); border:0;
+            QFrame#mioSidebar {{ background:{SIDEBAR_BG}; border:0;
                 border-right:1px solid {BORDER}; }}
             QLabel#mioBrand {{ font-size:14px; font-weight:600; color:{TEXT}; }}
             QLabel#mioNavGroup {{ font-size:11px; color:{MUTED}; padding:16px 9px 5px; }}
             QLabel#mioVersion {{ font-size:10px; color:{MUTED}; padding:8px 8px 0; }}
-            QLineEdit#mioNavSearch {{ background:#FDFBF7; color:{TEXT}; border:1px solid {BORDER};
+            QLineEdit#mioNavSearch {{ background:{FIELD_BG}; color:{TEXT}; border:1px solid {BORDER};
                 border-radius:6px; padding:7px; font-size:12px; }}
-            QFrame#mioFeedback {{ background:#F4EFE8; border:0; border-bottom:1px solid {BORDER}; }}
+            QFrame#mioFeedback {{ background:{FEEDBACK_BG}; border:0; border-bottom:1px solid {BORDER}; }}
             QPushButton[mioNav="true"] {{ background:transparent; color:{TEXT}; border:0;
                 border-radius:7px; padding:9px 11px; text-align:left; font-weight:normal; }}
-            QPushButton[mioNav="true"]:hover {{ background:#F0EBE4; }}
+            QPushButton[mioNav="true"]:hover {{ background:{NAV_HOVER}; }}
             QPushButton[mioNav="true"]:checked {{ background:{SOFT}; color:{ACCENT}; font-weight:600; }}
             QFrame#mioSidebar[compact="true"] QPushButton[mioNav="true"] {{ padding:9px 12px; }}
             QFrame#mioPageHeader {{ border:0; border-bottom:1px solid {BORDER}; }}

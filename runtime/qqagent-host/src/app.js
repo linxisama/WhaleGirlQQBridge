@@ -45,6 +45,8 @@ const UI_DIR = path.resolve(__dirname, '..', 'ui');
 
 // ── 白名单判断（移植自原版 allowed()） ───────────────────────────────────
 function allowed(kind, id, cfg) {
+  // 本地控制台会话（local:console）只存在于本机界面里，不走 QQ 白名单
+  if (kind === 'local') return true;
   const s = String(id);
   const denyList = cfg.deny?.[kind] ?? cfg.deny?.[`${kind}s`] ?? [];
   if (denyList.map(String).includes(s)) return false;
@@ -640,7 +642,11 @@ export function createApp({ log = console.log } = {}) {
   const stickers = new StickerManager(onebot);
   const sender =   new SendQueue({
     onebot, store,
-    onSent: ({ chatKey, text }) => log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`),
+    onSent: ({ chatKey, text }) => {
+      log(`[发送 -> ${chatKey}] ${String(text).slice(0, 60)}`);
+      // 本地会话的回复要立刻推给界面（QQ 那边有 chat-update 链路，本地没有）
+      if (String(chatKey).startsWith('local:')) emit('chat-update', chatKey);
+    },
     log
   });
   const reminders = new ReminderStore();
@@ -915,6 +921,35 @@ export function createApp({ log = console.log } = {}) {
     // 链接媒体转发（确定性）：刻意不 await —— 百兆级下载/上传不能卡住 ingest 热路径。
     // 内部已把错误全部收口（含 provider 抛错），这里再挂一次 catch 只为防漏网。
     forwardLinkedMedia(kind, id, text).catch((e) => log(`[media] 链接转发失败：${e?.message ?? e}`));
+  }
+
+  // ── 本地控制台会话：在软件里直接聊天 ────────────────────────────────
+  // 复用与 QQ 完全相同的链路（入库 → 编排器判定 → 模型 → send_message 工具），
+  // 唯一区别在 sender：它看到 `local:` 前缀就把回复写回库里给界面，不发往 QQ。
+  const LOCAL_CHAT_KEY = 'local:console';
+
+  /**
+   * 往本地会话里塞一条"我说的话"，然后触发编排器。
+   * @param {string} rawText 用户输入
+   * @returns {object} 入库后的 entry
+   */
+  async function sendLocalMessage(rawText) {
+    const text = String(rawText ?? '').trim();
+    if (!text) throw Object.assign(new Error('消息不能为空'), { expose: true, status: 400 });
+    if (text.length > 20000) throw Object.assign(new Error('消息太长（上限 20000 字）'), { expose: true, status: 400 });
+    const entry = store.appendIncoming(LOCAL_CHAT_KEY, {
+      mid: `local-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      ts: Date.now(),
+      senderId: 'local-user',
+      senderName: '主人',
+      text,
+      media: [],
+      atMe: true,
+      atNames: []
+    });
+    emit('chat-update', LOCAL_CHAT_KEY);
+    orchestrator.onIncoming(LOCAL_CHAT_KEY, entry);
+    return entry;
   }
 
   /**
@@ -1298,7 +1333,8 @@ export function createApp({ log = console.log } = {}) {
     qqPortableStatus, qqPortableLogs, launchPortableQQ, stopPortableQQ,
     visionScan, isPortOpen,
     buildUsageStats, buildUsageBreakdown,
-    reloadSkills
+    reloadSkills,
+    sendLocalMessage, LOCAL_CHAT_KEY
   });
 
   async function handleHttp(req, res) {

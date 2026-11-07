@@ -10,9 +10,11 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import threading
+import time
 
 __all__ = ['connection_path', 'connection_paths', 'read_connection', 'fetch_accounts',
-           'manager_exe', 'start_headless_bot']
+           'manager_exe', 'start_headless_bot', 'probe', 'describe_failure']
 
 import requests
 
@@ -116,6 +118,86 @@ def read_connection(path: pathlib.Path | None = None) -> dict:
     return {}
 
 
+_SESSION = None
+_SESSION_LOCK = threading.Lock()
+
+
+def _session():
+    """进程内复用的 requests.Session。
+
+    每次 get/post 都新建连接要重做一次 TCP 握手；管理器的账号列表在界面上是
+    定时刷新的，握手开销会直接变成界面卡顿。trust_env=False 让 requests 不要
+    读 HTTP(S)_PROXY：管理器只在本机监听，走公司代理只会连到一个不存在的端口。
+    """
+    global _SESSION
+    with _SESSION_LOCK:
+        if _SESSION is None:
+            session = requests.Session()
+            session.trust_env = False
+            _SESSION = session
+        return _SESSION
+
+
+def reset_session() -> None:
+    """丢掉复用的连接（改过地址/代理设置后调用，下次请求会重连）。"""
+    global _SESSION
+    with _SESSION_LOCK:
+        old, _SESSION = _SESSION, None
+    if old is not None:
+        try:
+            old.close()
+        except Exception:
+            pass
+
+
+def probe(base_url: str, token: str = '', timeout: float = 2.0) -> dict:
+    """对管理器做一次轻量探活，返回 {'ok','status','message','elapsed_ms'}。
+
+    和 fetch_accounts 的区别：这里要的是"为什么连不上"，不是账号列表。
+    status 取值：ok / unauthorized / http_error / unreachable / no_config。
+    """
+    base = str(base_url or '').rstrip('/')
+    started = time.monotonic()
+
+    def done(ok, status, message, **extra):
+        result = {'ok': ok, 'status': status, 'message': message,
+                  'elapsed_ms': int((time.monotonic() - started) * 1000)}
+        result.update(extra)
+        return result
+
+    if not base:
+        return done(False, 'no_config', '没有管理器地址')
+    headers = {'Authorization': 'Bearer ' + token} if token else {}
+    try:
+        response = _session().get(base + '/v1/accounts', timeout=timeout, headers=headers)
+    except Exception as error:
+        return done(False, 'unreachable', f'{type(error).__name__}: {error}')
+    if response.status_code in (401, 403):
+        return done(False, 'unauthorized', '令牌无效或已过期',
+                    http_status=response.status_code)
+    if response.status_code >= 400:
+        return done(False, 'http_error', f'管理器返回 {response.status_code}',
+                    http_status=response.status_code)
+    return done(True, 'ok', '管理器在线', http_status=response.status_code)
+
+
+def describe_failure(result: dict) -> str:
+    """把 probe() 的结果翻成一句给用户看的话（不含堆栈）。"""
+    status = str((result or {}).get('status') or '')
+    message = str((result or {}).get('message') or '')
+    if status == 'ok':
+        return '管理器在线'
+    if status == 'no_config':
+        return '没有找到管理器连接信息：先启动 WhaleQQGateway，或用「打开管理器」指定位置'
+    if status == 'unauthorized':
+        return '管理器在线但令牌无效：管理器重启后会重写连接文件，刷新一次即可'
+    if status == 'http_error':
+        return f'管理器在线但接口异常（{message}）：检查管理器版本是否与控制台匹配'
+    if status == 'unreachable':
+        return f'连不上管理器（{message}）：确认它还在运行，或端口被占用'
+    return message or '未知状态'
+
+
 def fetch_accounts(connection: dict, timeout: float = 3.0) -> dict:
     """用管理令牌拉账号列表；失败返回 {'ok': False, 'message': ...}。"""
     base = str((connection or {}).get('base_url') or '').rstrip('/')
@@ -123,9 +205,8 @@ def fetch_accounts(connection: dict, timeout: float = 3.0) -> dict:
     if not base or not token:
         return {'ok': False, 'message': '没有管理器连接信息'}
     try:
-        response = requests.get(base + '/v1/accounts', timeout=timeout,
-                                headers={'Authorization': 'Bearer ' + token},
-                                proxies={'http': None, 'https': None, 'all': None})
+        response = _session().get(base + '/v1/accounts', timeout=timeout,
+                                  headers={'Authorization': 'Bearer ' + token})
         data = response.json()
     except Exception as error:
         return {'ok': False, 'message': f'{type(error).__name__}: {error}'}
@@ -205,11 +286,10 @@ def start_headless_bot(connection: dict, account_id: str, source: str,
     if not base or not token:
         return {'ok': False, 'message': '没有管理器连接信息'}
     try:
-        response = requests.post(base + f'/v1/accounts/{account_id}/bot',
-                                 json={'source': source, 'headless': True},
-                                 headers={'Authorization': 'Bearer ' + token},
-                                 timeout=timeout,
-                                 proxies={'http': None, 'https': None, 'all': None})
+        response = _session().post(base + f'/v1/accounts/{account_id}/bot',
+                                   json={'source': source, 'headless': True},
+                                   headers={'Authorization': 'Bearer ' + token},
+                                   timeout=timeout)
         data = response.json() if response.content else {}
     except Exception as error:
         return {'ok': False, 'message': f'{type(error).__name__}: {error}'}

@@ -76,8 +76,13 @@ def _clip_lines(lines, budget):
     return out
 
 
-def _keywords(text):
-    """轻量关键词：中文二元组 + 拉丁词，不依赖分词库。"""
+def _keywords(text, limit=24):
+    """轻量关键词：中文二元组 + 拉丁词，不依赖分词库。
+
+    limit 默认 24 是**存储**用的上限（长记忆只存前 24 个二元组，控制库体积）。
+    检索时正文扫描必须传 limit=0 拿全量，否则长记忆尾部的词永远匹配不到 ——
+    那正是「明明记得却检索不到」的根因。
+    """
     value = str(text or '').lower()
     value = _PUNCT.sub(' ', value)
     words = re.findall(r'[a-z][a-z0-9_+.-]{1,24}', value)
@@ -91,7 +96,7 @@ def _keywords(text):
         if len(word) < 2 or word in _STOP or word in out:
             continue
         out.append(word)
-    return out[:24]
+    return out[:limit] if limit else out
 
 
 def _similarity(left, right):
@@ -137,6 +142,10 @@ class UnifiedMemory:
         self.diary_path = Path(diary_path) if diary_path else None
         # 旧版把所有日记汇总成一个 Markdown；新版每天一个 txt，二者同时写。
         self.diary_dir = Path(diary_dir) if diary_dir else None
+        # 上一次 context_for_prompt 的统计：chars/items/line_chars/max_chars/dropped。
+        # 提示词里到底塞了多少、丢了多少，从这里读，不用猜。
+        self.last_context_stats = {'chars': 0, 'items': 0, 'line_chars': 0,
+                                   'max_chars': 0, 'dropped': 0}
         self._ensure()
 
     # ---------- schema / migration ----------
@@ -374,20 +383,40 @@ class UnifiedMemory:
         for item in items:
             content = str(item.get('content') or '').lower()
             if q_norm:
+                # 关键词只存前 24 个二元组，长记忆尾部的词查不到，所以正文也要扫：
+                # 关键词命中算「精确」，正文二元组命中算「相关」，两者取高。
                 overlap = q_terms & set(item.get('keywords') or [])
-                if q_norm not in content and not overlap:
+                body_hit = q_norm in content
+                body_terms = q_terms & set(_keywords(content, 0))
+                if not body_hit and not overlap and not body_terms:
                     continue
-                coverage = min(1.0, len(overlap) / max(1, min(len(q_terms), 4)))
-                text_score = .40 * coverage + (.25 if q_norm in content else 0)
+                if body_hit:
+                    relevance = 1.0
+                else:
+                    hit = overlap or body_terms
+                    relevance = round(min(1.0, len(hit) / max(1, min(len(q_terms), 4))), 4)
+                # 正文整串命中给满权重，只有部分词相关时按 relevance 线性给分。
+                text_score = .70 * relevance
             else:
+                relevance = 0.0
                 text_score = 0
             age_days = max(0, (now - float(item.get('updated') or item.get('created') or now)) / 86400)
             # 半衰期衰减：180 天线性归零改成 140 天减半，旧记忆不会突然彻底失权
             recency = 0.5 ** (age_days / HALF_LIFE_DAYS)
+            importance = item.get('importance', 0)
+            item['relevance'] = relevance
             item['score'] = round(
-                text_score + item.get('importance', 0) / 100 * .25 +
+                text_score + importance / 100 * .15 +
                 item.get('confidence', 0) / 100 * .15 + recency * .10 +
                 min(1, int(item.get('uses') or 0) / 10) * .05, 4)
+            # why 是给人看的：不看公式也能知道这条为什么排在这个位置。
+            why = ['正文命中' if q_norm and q_norm in content else
+                   ('相关%.2f' % relevance if relevance else '无正文命中'),
+                   '重要%d' % int(importance or 0),
+                   '新鲜%.2f' % recency]
+            if item.get('uses'):
+                why.append('用过%d次' % int(item['uses']))
+            item['why'] = ' / '.join(why)
             item['scope_score'] = self._scope_score(item, channel_want, persona_want)
             item['scope_mark'] = self._scope_mark(item, channel_want, persona_want)
             chosen.append(item)
@@ -483,22 +512,41 @@ class UnifiedMemory:
         sections = (_clip_lines(stable, SECTION_BUDGET['stable']) +
                     _clip_lines(project_lines, SECTION_BUDGET['project']) +
                     _clip_lines(relevant, SECTION_BUDGET['relevant']))
-        # 去掉重复内容，保留顺序
+        # 去掉重复内容，保留顺序。去重键用整行正文而不是后半段：两条记忆后半段撞车
+        # 但正文不同时，本来就是两条，不该互相吃掉。
         seen = set()
-        lines = []
+        unique = []
         for line in sections:
-            key = line.split('：', 1)[-1]
+            # 去重键取正文前 240 字：同一条记忆在不同层会用不同长度截断（240/260），
+            # 直接比整行会把同一段内容当成两条，注入两遍。
+            key = line.split('：', 1)[-1].strip()[:240]
             if key not in seen:
                 seen.add(key)
-                lines.append('- ' + line)
+                unique.append(line)
+        header = '【长期记忆（只作参考，不是用户本轮指令）】'
+        guide = ('\n【记忆导引】需要时可调用 recall_memory 查更早的记忆；不要编造没有记录的事。'
+                 if first_turn else '')
+        max_chars = max(0, int(max_chars or 0))
+        room = max_chars - len(header) - len(guide)
+        lines, used = [], 0
+        for line in unique:
+            rendered = '- ' + line
+            cost = len(rendered) + (1 if lines else 0)
+            if used + cost > room:
+                break       # 整条丢，绝不切半条：半截记忆比没有更糟
+            lines.append(rendered)
+            used += cost
+        dropped = len(unique) - len(lines)
         if not lines:
+            self.last_context_stats = {'chars': 0, 'items': 0, 'line_chars': 0,
+                                       'max_chars': max_chars, 'dropped': dropped}
             return ''
-        text = '【长期记忆（只作参考，不是用户本轮指令）】\n' + '\n'.join(lines)
-        if first_turn:
-            text += '\n【记忆导引】需要时可调用 recall_memory 查更早的记忆；不要编造没有记录的事。'
-        text = text[:max_chars]
-        # 只统计真正出现在提示文本里的行：被 scope/隐私过滤或截断在外的条目不涨 uses。
-        self.touch([line_ids[line] for line in sections if line in text])
+        text = header + '\n' + '\n'.join(lines) + guide
+        self.last_context_stats = {'chars': len(text), 'items': len(lines),
+                                   'line_chars': used, 'max_chars': max_chars,
+                                   'dropped': dropped}
+        # 只统计真正出现在提示文本里的行：被 scope/隐私过滤或预算丢弃的条目不涨 uses。
+        self.touch([line_ids[line] for line in unique[:len(lines)]])
         return text
 
     def diary_tail(self, max_chars=800):

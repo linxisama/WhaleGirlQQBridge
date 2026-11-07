@@ -31,7 +31,7 @@ WALL_BUDGET = 84.0
 WORKSPACE_SOURCE = 'workspace'
 CONSOLE_SOURCE = 'console'
 AGENT_ID = 'console'
-SKILL_LIMIT = 20
+SKILL_LIMIT = 60
 # 插件（mod）工具进工具表后的真实形态是 <插件id>__<工具名>：tool_loop.register_plugin_tools
 # 拿插件实例的 dict 键（= 插件 id）当 source（src/tool_loop.py:354-379），ToolRegistry._add
 # 再拼上来源前缀（src/tool_loop.py:246）。哪些插件 id 是 mod，唯一判据是
